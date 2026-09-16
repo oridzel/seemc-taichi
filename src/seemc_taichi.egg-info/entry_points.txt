@@ -1,6 +1,0 @@
-[console_scripts]
-seemc-reference-emissions = seemc_taichi.reference_sweep_cli:main
-seemc-taichi-animate-trapezoid = seemc_taichi.trajectory_anim_cli:main
-seemc-taichi-info = seemc_taichi.cli:main
-seemc-taichi-sweep = seemc_taichi.sweep_cli:main
-seemc-taichi-trapezoid = seemc_taichi.trapezoid_scan_cli:main

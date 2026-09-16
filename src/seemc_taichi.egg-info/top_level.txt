@@ -1,1 +1,0 @@
-seemc_taichi

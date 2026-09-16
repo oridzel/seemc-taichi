@@ -41,6 +41,8 @@ def _parser():
     p.add_argument("--lle-max-loss-ev", type=float, default=50.0)
     p.add_argument("--trace-pixel", type=int, action="append", default=[], help="pixel index to record trajectories for; may be given multiple times")
     p.add_argument("--trace-x-nm", type=float, action="append", default=[], help="beam x position to trace; nearest scan pixel is selected; may be repeated")
+    p.add_argument("--trace-all-pixels", action="store_true", help="record trajectories for every scan pixel")
+    p.add_argument("--trace-every", type=int, default=0, help="record trajectories every Nth scan pixel (0 disables)")
     p.add_argument("--trace-primaries", type=int, default=0, help="number of root primaries to trace for each traced pixel")
     p.add_argument("--trajectory-capacity", type=int, default=200000, help="maximum stored trajectory points per traced pixel")
     p.add_argument("--output-prefix", type=Path, default=Path("trapezoid_taichi"))
@@ -76,6 +78,8 @@ def main(argv=None):
         p.error("--steps-per-chunk must be positive")
     if args.trace_primaries < 0:
         p.error("--trace-primaries must be non-negative")
+    if args.trace_every < 0:
+        p.error("--trace-every must be non-negative")
     if args.trajectory_capacity < 1:
         p.error("--trajectory-capacity must be positive")
     for pix in args.trace_pixel:
@@ -126,6 +130,10 @@ def main(argv=None):
     x_nm = np.linspace(-0.5 * args.scan_width_nm, 0.5 * args.scan_width_nm, args.pixels)
     x = 10.0 * x_nm
     trace_pixels = set(int(v) for v in args.trace_pixel)
+    if args.trace_all_pixels:
+        trace_pixels.update(range(args.pixels))
+    if args.trace_every and args.trace_every > 0:
+        trace_pixels.update(range(0, args.pixels, args.trace_every))
     for xpos in args.trace_x_nm:
         trace_pixels.add(int(np.argmin(np.abs(x_nm - float(xpos)))))
     if trace_pixels:
@@ -168,6 +176,8 @@ def main(argv=None):
         "lle_max_loss_ev": args.lle_max_loss_ev,
         "trace_pixels": sorted(trace_pixels),
         "trace_x_nm_requested": list(args.trace_x_nm),
+        "trace_all_pixels": bool(args.trace_all_pixels),
+        "trace_every": int(args.trace_every),
         "trace_primaries": args.trace_primaries,
         "trajectory_capacity": args.trajectory_capacity,
         "barrier_model": surface.barrier_model,

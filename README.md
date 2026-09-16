@@ -1,180 +1,85 @@
 # seemc-taichi
 
-Experimental Taichi acceleration backend for SEEMC electron Monte Carlo transport.
+Experimental Taichi acceleration backend for SEEMC. It remains separate from
+`seemc-imaging`: the validated Python transport is the reference implementation,
+and each accelerated stage is checked statistically before it is used for
+production simulation.
 
-`seemc-taichi` is intentionally separate from `seemc-imaging`: the validated Python implementation remains the physics reference, while the Taichi backend provides accelerated CPU/GPU execution and is checked statistically against the reference before new features are used for production calculations.
+## v0.5.0 scope
 
-Current package version: **v0.7.2**.
+v0.5 is the first **complete planar transport slice**. It combines:
 
-## Current capabilities
+- v0.2 elastic free flight and angular scattering;
+- v0.3 inelastic `omega/q` sampling and dynamic secondary cascades;
+- v0.4 incoming/outgoing surface-barrier physics; and
+- a z=0 plane transport loop that returns real TEY/SEY/BSEY and event-level
+  emissions.
 
-The accelerated backend currently includes:
+The plane convention matches current SEEMC: solid `z > 0`, vacuum `z < 0`,
+outward normal `(0, 0, -1)`. A sampled free path is truncated when the plane is
+reached first. **No collision is applied to a surface-truncated leg.** An
+internally reflected electron starts the next leg with a newly sampled free path.
 
-- elastic free-flight sampling and ELSEPA angular scattering;
-- inelastic SE/plasmon channel selection;
-- truncated energy-loss sampling and conditional momentum-transfer sampling;
-- dynamic secondary-electron cascade creation;
-- semiconductor transport conventions used by the current SEEMC Si model;
-- incoming and outgoing surface-barrier physics;
-- validated planar TEY/SEY/BSEY simulations;
-- energy/angle yield sweeps and emission-event export;
-- analytic raised-trapezoid transport for SEM line scans;
-- current SE1/SE2 classification;
-- selected trajectory recording and animation;
-- Apple Metal `f32`, CPU `f32/f64`, and other Taichi backends supported by the local installation.
+`steps_per_chunk` is only a GPU scheduling bound. Reaching the chunk bound does
+not kill an electron; the host relaunches that allocation wave until every member
+physically terminates. This replaces the v0.3 benchmark's temporary step-cap
+termination.
 
-The Taichi planar implementation has been statistically validated against current Python SEEMC for Si at multiple energies, including 100 eV, 500 eV, 1 keV, and 5 keV.
+The emission buffer stores final vacuum energy/direction plus electron, parent,
+root-primary and generation IDs. Direct incoming-barrier reflections are included
+as immediate primary emissions, matching current Python SEEMC accounting.
 
----
-
-# Installation
-
-From the package directory:
+## Install
 
 ```bash
 python3 -m pip install -e '.[reference,test]'
 python3 -m pytest -q
 ```
 
-If console commands such as `pytest` or `seemc-taichi-trapezoid` are installed but not found by `zsh`, either run Python entry points with `python3 -m ...` where applicable or add your Python scripts directory to `PATH`.
+## 1. Re-run the already validated component checks
 
-For the Python.org macOS install used during development this is typically:
-
-```bash
-export PATH="/Library/Frameworks/Python.framework/Versions/3.13/bin:$PATH"
-```
-
-Add that line to `~/.zshrc` if you want it to persist.
-
----
-
-# Coordinate and energy conventions
-
-The trapezoid and planar geometry follow the current SEEMC convention:
-
-```text
-vacuum:       z < exposed surface
-solid:        z > local surface
-substrate:    z >= 0
-trapezoid top z = -height
-```
-
-For the trapezoid:
-
-```text
-             top width
-          ┌────────────┐       z = -height
-         /              \
-        /                \
-───────/──────────────────\──── substrate z = 0
-       <---- bottom ---->
-```
-
-The line is infinite in `y`.
-
-Important transport rules preserved from Python SEEMC:
-
-- incident CLI energy is vacuum energy `E0`;
-- inside-solid energy is `E_s`;
-- a sampled free path is truncated if an exposed surface is reached first;
-- **no collision is applied to a surface-truncated flight**;
-- after internal reflection a new free path is sampled;
-- parallel momentum is conserved across the surface barrier;
-- secondary parent/root/generation lineage is preserved.
-
----
-
-# Signal definitions
-
-The line-scan output contains both detector-style energy channels and lineage channels. These are deliberately kept separate.
-
-## Conventional energy split
-
-```text
-SEY   = emitted electrons with vacuum energy <= BSE cutoff
-BSEY  = emitted electrons with vacuum energy >  BSE cutoff
-```
-
-The default compatibility cutoff is 50 eV.
-
-## Lineage split
-
-```text
-TEY          = every emitted electron
-Cascade all  = every emitted cascade-origin electron
-Primary all  = every emitted original incident primary
-```
-
-These satisfy:
-
-```text
-TEY = SEY + BSEY
-TEY = Cascade all + Primary all
-```
-
-## Current SE1 / SE2 definition
-
-The current imaging definition is:
-
-**SE1**
-- generation = 1; and
-- that secondary escapes without experiencing any inelastic collision of its own;
-- elastic collisions are allowed.
-
-**SE2**
-- every other emitted cascade electron.
-
-Therefore:
-
-```text
-Cascade all = SE1 + SE2
-```
-
-This classification is independent of the 50 eV SE/BSE cutoff.
-
----
-
-# Planar validation
-
-## Elastic sampling
+Elastic:
 
 ```bash
 python3 examples/validate_elastic_sampling.py \
+  ../MaterialDatabase.pkl --material Si \
+  --arch cpu --precision f64 --energy 1000 --n 200000
+```
+
+Inelastic:
+
+```bash
+python3 examples/validate_inelastic_sampling.py \
+  ../MaterialDatabase.pkl --material Si \
+  --arch metal --precision f32 --energy 1000 --n 20000
+```
+
+Barrier:
+
+```bash
+python3 examples/validate_surface_barrier.py \
+  ../MaterialDatabase.pkl --material Si \
+  --arch metal --precision f32 \
+  --energy-solid 100 --energy-vac 1000 --angle 0 --n 200000
+```
+
+## 2. First full planar parity test
+
+Start with CPU/f64 and modest statistics:
+
+```bash
+python3 examples/validate_plane_yield.py \
   ../MaterialDatabase.pkl \
   --material Si \
   --arch cpu \
   --precision f64 \
   --energy 1000 \
-  --n 200000
-```
-
-## Inelastic sampling
-
-```bash
-python3 examples/validate_inelastic_sampling.py \
-  ../MaterialDatabase.pkl \
-  --material Si \
-  --arch metal \
-  --precision f32 \
-  --energy 1000 \
-  --n 20000
-```
-
-## Surface barrier
-
-```bash
-python3 examples/validate_surface_barrier.py \
-  ../MaterialDatabase.pkl \
-  --material Si \
-  --arch metal \
-  --precision f32 \
-  --energy-solid 100 \
-  --energy-vac 1000 \
   --angle 0 \
-  --n 200000
+  --n 2000 \
+  --capacity 200000
 ```
 
-## Full planar yield parity
+Then Metal/f32:
 
 ```bash
 python3 examples/validate_plane_yield.py \
@@ -188,15 +93,62 @@ python3 examples/validate_plane_yield.py \
   --capacity 200000
 ```
 
-The validator reports Python-reference and Taichi TEY/SEY/BSEY, Monte Carlo pulls, spectrum-distance diagnostics, allocation size, and transport counters.
+The validator reports Python-reference and Taichi TEY/SEY/BSEY, combined
+Monte-Carlo pulls, emission-energy histogram TV distance, emitted-direction norm
+error, allocation size and all transport diagnostics. Increase `--capacity` if
+there is any particle or emission overflow; an overflowed run is not a yield test.
 
-Never use yields from a run with particle or emission-buffer overflow.
+## 3. Full planar Metal benchmark
 
----
+```bash
+python3 examples/plane_yield_benchmark.py \
+  ../MaterialDatabase.pkl \
+  --material Si \
+  --arch metal \
+  --precision f32 \
+  --energy 1000 \
+  --angle 0 \
+  --n 10000 \
+  --capacity 500000 \
+  --steps-per-chunk 256
+```
 
-# Batch planar energy/angle sweeps
+This reports actual planar yields as well as warmed transport throughput. The
+benchmark calls `ti.sync()` before stopping the timer.
 
-A complete energy sweep can be run with one Taichi initialization:
+## Physics conventions preserved
+
+- Inside-solid energy is `E_s`, referenced to the valence-band bottom.
+- Incident CLI energy is vacuum energy `E0`; transmitted primaries enter with
+  `E_s = E0 + U_i` and the reciprocal barrier refraction.
+- Elastic and inelastic tables use the same configurable energy references as
+  current Python SEEMC.
+- Semiconductor inelastic thresholds, `omega` window and q kinematics match the
+  current model.
+- Channel DIIMFP CDFs are truncated before loss sampling.
+- Secondary children preserve immediate parent, root primary and generation.
+- With `track_subbarrier=False`, inside-solid electrons at/below `U_i` are
+  terminal and newly born secondaries at/below `U_i` are not queued.
+- On an outgoing surface encounter, escape uses the configured
+  `abrupt`/`classical`/`expqm` barrier and preserves parallel momentum.
+- Conventional SE/BSE counters use the configured 50 eV compatibility cutoff;
+  ancestry-based cascade/primary yields are reported separately.
+
+## Roadmap
+
+- **v0.1:** SoA particle pool and atomic cascade allocation — complete.
+- **v0.2:** real elastic transport — complete/validated.
+- **v0.3:** real inelastic transport and secondary creation — complete/validated
+  on Si CPU/Metal single-event tests.
+- **v0.4:** standalone incoming/outgoing surface barrier — complete/validated.
+- **v0.5:** coupled planar transport + TEY/SEY/BSEY + emission buffer — current.
+- **next:** establish planar yield/spectrum parity over energy and angle, then add
+  a sampler-compatible accelerated batch API.
+- **later:** trapezoid/scene geometry and imaging batches.
+
+## v0.6 batch planar yield sweeps
+
+Run a complete normal-incidence energy sweep with one Taichi initialization:
 
 ```bash
 seemc-taichi-sweep ../MaterialDatabase.pkl \
@@ -210,54 +162,49 @@ seemc-taichi-sweep ../MaterialDatabase.pkl \
   --output si_yield_taichi.csv
 ```
 
-A full energy-angle grid works the same way:
+The same runner accepts an energy-angle grid, for example:
 
 ```bash
 seemc-taichi-sweep ../MaterialDatabase.pkl \
-  --material Si \
-  --arch metal \
-  --precision f32 \
+  --material Si --arch metal --precision f32 \
   --energies 100 200 500 1000 2000 5000 10000 \
   --angles 0 30 45 60 75 80 85 \
-  --n 10000 \
-  --capacity 5000000 \
-  --output si_yield_map.csv \
-  --resume
+  --n 10000 --capacity 5000000 \
+  --output si_yield_map.csv --resume
 ```
 
-Useful options:
+`--resume` skips valid points already in the CSV and retries points previously marked invalid.  The CSV is rewritten atomically after every completed point, so an interrupted sweep keeps its prior results.  Overflowed or otherwise incomplete runs are retained through `raw_*` columns but the primary `tey`, `sey`, `bsey`, `cascade_yield`, and `primary_yield` columns are written as NaN and `valid=False`.
 
-```text
---resume          skip already valid points and retry invalid points
---save-emissions  write emitted-electron NPZ files for spectrum/angle analysis
-```
+Use `--save-emissions` to write one compressed NPZ per energy/angle containing emitted energy, direction, lineage, generation, and mechanism arrays.  The example script `examples/plane_yield_sweep.py` exposes the same interface if you prefer to invoke it with Python directly.
+\n\n## v0.6.1 Python-reference emission export\n\nGenerate reference `seemc-imaging` emission events in an NPZ layout that mirrors\nthe Taichi sweep output.  This is intended for direct spectrum, angle and lineage\nparity checks.\n\n```bash\nseemc-reference-emissions ../MaterialDatabase.pkl \\\n  --material Si \\\n  --energies 100 500 1000 5000 \\\n  --angle 0 \\\n  --n 5000 \\\n  --workers 1 \\\n  --output-dir si_reference_emissions \\\n  --resume\n```\n\nThe equivalent example-script invocation is:\n\n```bash\npython3 examples/reference_emission_sweep.py \\\n  ../MaterialDatabase.pkl \\\n  --material Si \\\n  --energies 100 500 1000 5000 \\\n  --angle 0 --n 5000 \\\n  --output-dir si_reference_emissions\n```\n\nEach point writes, for example,\n`Si_100eV_a0deg_reference_emissions.npz`.  The file contains the same core\narrays as the accelerated output (`emission_energy_ev`, `emission_ux/uy/uz`,\n`emission_electron_id`, `emission_parent_id`, `emission_root_primary_id`,\n`emission_generation`, `emission_is_cascade`, and numeric\n`emission_mechanism`) plus reference-only mechanism labels, birth depth and\nbarrier-reflection probability.\n\nThe exporter derives a deterministic seed independently for every energy/angle\npoint, writes a summary `reference_yields.csv` after each completed point, and\nsupports `--resume`.  It verifies that the raw exported event counts reproduce\nthe reference solver's SEY/BSEY before committing each NPZ.\n
+## v0.6.2: rare conditional-q retry
 
-Invalid points retain raw diagnostic values but their main physical yield columns are written as `NaN` so they are not accidentally used as valid results.
+The inelastic kernel now keeps the selected channel fixed and retries the
+`omega -> q` conditional draw up to four times when a numerically empty q CDF
+is encountered.  `q_cdf_empty` is incremented only if all retries fail.  This
+is intended for extremely rare f32/table-interpolation edge cases and does not
+change ordinary events.
 
----
+## v0.7.0: Taichi trapezoidal line scan
 
-# Python-reference emission export
+v0.7.0 extends the validated planar Taichi transport to the analytic
+`TrapezoidalLine` geometry used by SEEMC imaging.  The line is infinite in y,
+vacuum is toward negative z, the top is at `z=-height`, and the bulk substrate
+starts at `z=0`.  Free flights are truncated at the first exposed top,
+sidewall, or substrate surface before barrier physics is applied.
 
-To generate emission distributions from the Python reference solver in a format comparable with Taichi:
+The line-scan runner keeps one material/table set and one Taichi engine alive
+for the whole scan.  A finite Gaussian beam is sampled separately at each
+pixel, so primaries close to an edge may land on different faces naturally.
+The output includes yield and Monte-Carlo SEM for TEY, conventional SE/BSE,
+all cascade emissions, all emitted original primaries, and the current SE1/SE2
+classification:
 
-```bash
-seemc-reference-emissions ../MaterialDatabase.pkl \
-  --material Si \
-  --energies 100 500 1000 5000 \
-  --angle 0 \
-  --n 5000 \
-  --workers 1 \
-  --output-dir si_reference_emissions \
-  --resume
-```
+- **SE1:** generation 1 and no inelastic collision experienced by that emitted
+  secondary itself (elastic collisions are allowed).
+- **SE2:** every other emitted cascade electron.
 
-Each NPZ contains emitted energy, direction, electron/parent/root IDs, generation, cascade flag, and mechanism information.
-
----
-
-# Trapezoidal line scan
-
-The main command is:
+A typical Apple-Metal run is:
 
 ```bash
 seemc-taichi-trapezoid ../MaterialDatabase.pkl \
@@ -273,397 +220,57 @@ seemc-taichi-trapezoid ../MaterialDatabase.pkl \
   --primaries-per-pixel 1000 \
   --beam-fwhm-nm 2 \
   --capacity 500000 \
-  --steps-per-chunk 256 \
   --output-prefix si_trapezoid_1keV \
   --plot
 ```
 
-The finite Gaussian beam is sampled primary-by-primary. Near a geometric edge, primaries belonging to one nominal raster pixel can therefore land on different physical surfaces naturally.
+This writes `si_trapezoid_1keV.csv`, `si_trapezoid_1keV.npz`, and (with
+`--plot`) `si_trapezoid_1keV.png`.  Any pixel that hits particle/emission
+capacity or a fatal transport diagnostic is marked invalid and its primary
+yield columns are written as NaN in the CSV; the raw diagnostics remain
+available for debugging.
+\n\n## v0.7.3 trajectory animation\n\nTrapezoid scans can record a small, selected set of root primaries and all of\ntheir descendants.  This is intended for visualization/debugging; do not trace\nall high-statistics primaries because trajectory records are much larger than\nyield counters.\n\nExample scan with one traced sidewall pixel:\n\n```bash\nseemc-taichi-trapezoid ../MaterialDatabase.pkl \\\n  --material Si --arch metal --precision f32 \\\n  --energy-ev 1000 --top-width-nm 50 --bottom-width-nm 70 --height-nm 50 \\\n  --scan-width-nm 150 --pixels 201 --primaries-per-pixel 1000 \\\n  --beam-fwhm-nm 2 --capacity 500000 \\\n  --trace-pixel 60 --trace-primaries 20 --trajectory-capacity 200000 \\\n  --output-prefix si_trapezoid_1keV --plot\n```\n\nThe traced-pixel file can then be animated and linked to the full line scan:\n\n```bash\nseemc-taichi-animate-trapezoid \\\n  si_trapezoid_1keV_pixel060_trajectories.npz \\\n  --scan-npz si_trapezoid_1keV.npz \\\n  --color-by lineage \\\n  --output si_trapezoid_pixel060_lineage.gif\n```\n\n`--trace-x-nm` is usually easier than calculating a pixel index; it selects the nearest scan pixel.  `--color-by` accepts `lineage`, `generation`, `event`, or `energy`.  Lineage\nuses the current SEEMC imaging rule: Primary; SE1 = generation 1 and zero own\ninelastic collisions; SE2 = all other cascade electrons.  With `--scan-npz`,\nthe right panel shows TEY, Cascade all, Primary all, SE1 and SE2 and marks the\nanimated pixel.  Geometry is read from trajectory metadata, so width/height\narguments are normally unnecessary for files made by v0.7.1 or later.\n
+### Full scan animation
 
-Typical outputs:
+To animate the **entire** trapezoid line scan, record a small number of traced
+primaries for many or all pixels. The particle `--capacity` still controls the
+main Monte Carlo transport and must be large enough for physics to be valid.
+`--trajectory-capacity` is separate and only caps the number of stored
+trajectory points **per traced pixel**.
 
-```text
-si_trapezoid_1keV.csv
-si_trapezoid_1keV.npz
-si_trapezoid_1keV.png
-```
-
-The default quick-look plot shows:
-
-```text
-TEY
-Cascade all
-Primary all
-SE1
-SE2
-```
-
-with Monte Carlo confidence bands.
-
-The CSV/NPZ also contain conventional `sey_50ev` and `bsey_50ev` channels.
-
----
-
-# `--capacity` vs `--trajectory-capacity`
-
-These control **different memory pools**.
-
-## `--capacity`
-
-`--capacity` is the size of the **actual transport particle pool** for each raster pixel.
-
-It stores:
-
-```text
-original primaries
-+ generation-1 secondaries
-+ generation-2 secondaries
-+ generation-3 secondaries
-+ ...
-```
-
-Example:
-
-```bash
---primaries-per-pixel 1000 \
---capacity 500000
-```
-
-means each pixel starts with 1,000 primaries but has room for up to 500,000 total particle records after secondary generation.
-
-If this pool fills:
-
-```text
-particle_overflow = True
-```
-
-The transport cascade is truncated and **that pixel is physically invalid**.
-
-A too-small `--capacity` affects the simulation result itself.
-
-### Recommended strategy
-
-For a new energy/material/geometry:
-
-1. start with a generous value;
-2. inspect `allocated`, `stored`, and `particle_overflow`;
-3. reduce later if memory matters.
-
-For the current 1 keV Si trapezoid with 1,000 primaries/pixel:
-
-```bash
---capacity 500000
-```
-
-has been a comfortable development value.
-
-Higher incident energies can produce much larger cascades and may require substantially larger pools.
-
----
-
-## `--trajectory-capacity`
-
-`--trajectory-capacity` is only the size of the **optional trajectory-recording buffer** used for visualization/debugging.
-
-A recorded trajectory point can represent events such as:
-
-```text
-launch
-elastic collision
-inelastic collision
-secondary birth
-surface hit
-internal reflection
-escape
-termination
-```
-
-One electron can therefore contribute many trajectory points.
-
-Example:
-
-```bash
---trace-primaries 20 \
---trajectory-capacity 200000
-```
-
-means:
-
-- all simulation primaries are still transported normally;
-- only the selected 20 root-primary lineages are recorded;
-- up to 200,000 trajectory points may be saved for that traced pixel.
-
-If the trajectory buffer fills, the **physics calculation can still be valid**, but the saved animation is incomplete.
-
-So the distinction is:
-
-| Option | Stores | Too small means |
-|---|---|---|
-| `--capacity` | actual transported electrons | simulation/pixel invalid |
-| `--trajectory-capacity` | visualization points | animation incomplete |
-
-Trajectory tracing should normally use only a small number of primaries because event records are much larger than yield counters.
-
----
-
-# Recording trajectories
-
-There are two convenient ways to choose traced pixels.
-
-## By pixel index
-
-```bash
---trace-pixel 60
-```
-
-The option may be repeated:
-
-```bash
---trace-pixel 60 \
---trace-pixel 100 \
---trace-pixel 140
-```
-
-## By physical beam position
-
-Usually easier:
-
-```bash
---trace-x-nm -30 \
---trace-x-nm 0 \
---trace-x-nm 30
-```
-
-The nearest raster pixel is selected automatically.
-
-A useful 1 keV diagnostic run is:
+A practical whole-scan example is:
 
 ```bash
 seemc-taichi-trapezoid ../MaterialDatabase.pkl \
-  --material Si \
-  --arch metal \
-  --precision f32 \
-  --energy-ev 1000 \
-  --top-width-nm 50 \
-  --bottom-width-nm 70 \
-  --height-nm 50 \
-  --scan-width-nm 150 \
-  --pixels 201 \
-  --primaries-per-pixel 1000 \
-  --beam-fwhm-nm 2 \
-  --capacity 500000 \
-  --steps-per-chunk 256 \
-  --trace-x-nm -30 \
-  --trace-x-nm 0 \
-  --trace-x-nm 30 \
-  --trace-primaries 20 \
-  --trajectory-capacity 200000 \
-  --output-prefix si_trapezoid_1keV \
-  --plot
+  --material Si --arch metal --precision f32 \
+  --energy-ev 1000 --top-width-nm 50 --bottom-width-nm 70 --height-nm 50 \
+  --scan-width-nm 150 --pixels 201 --primaries-per-pixel 1000 \
+  --beam-fwhm-nm 2 --capacity 500000 \
+  --trace-all-pixels --trace-primaries 3 --trajectory-capacity 50000 \
+  --output-prefix si_trapezoid_1keV --plot
 ```
 
-Each traced pixel writes a file such as:
-
-```text
-si_trapezoid_1keV_pixel060_trajectories.npz
-```
-
-The file contains event positions, energy, electron/parent/root IDs, generation, inelastic count, event code, surface code, and step index.
-
----
-
-# Trajectory animation
-
-Use:
-
-```text
-seemc-taichi-animate-trapezoid
-```
-
-The animation can optionally be linked to the full scan NPZ. In that mode the trajectory panel is shown beside the full line profile with a marker at the traced pixel.
-
-## Color by lineage
+That creates `si_trapezoid_1keV.npz` plus one trajectory NPZ per traced pixel.
+Then build the full scan movie with:
 
 ```bash
-seemc-taichi-animate-trapezoid \
-  si_trapezoid_1keV_pixel060_trajectories.npz \
-  --scan-npz si_trapezoid_1keV.npz \
+seemc-taichi-animate-scan \
+  si_trapezoid_1keV.npz \
   --color-by lineage \
-  --output left_sidewall_lineage.gif \
-  --fps 15
+  --frames-per-pixel 10 \
+  --output si_trapezoid_1keV_scan.mp4
 ```
 
-Lineage colors distinguish:
+The full-scan movie moves the beam pixel-by-pixel across the structure, shows
+the line profile building up on the right panel, and if a trajectory file exists
+for the current pixel, displays its traced trajectories on the left panel. If a
+pixel was not traced, the animation still shows the beam position and the
+profile accumulation for that pixel.
 
-```text
-Primary
-SE1
-SE2
-```
+Useful whole-scan controls:
 
-## Color by generation
-
-```bash
-seemc-taichi-animate-trapezoid \
-  si_trapezoid_1keV_pixel060_trajectories.npz \
-  --scan-npz si_trapezoid_1keV.npz \
-  --color-by generation \
-  --output left_sidewall_generation.gif
-```
-
-## Color by event
-
-```bash
-seemc-taichi-animate-trapezoid \
-  si_trapezoid_1keV_pixel060_trajectories.npz \
-  --scan-npz si_trapezoid_1keV.npz \
-  --color-by event \
-  --output left_sidewall_events.gif
-```
-
-Useful event categories include launch, elastic collision, inelastic collision, spawn, surface hit, reflection, escape, and termination.
-
-## Color by energy
-
-```bash
-seemc-taichi-animate-trapezoid \
-  si_trapezoid_1keV_pixel060_trajectories.npz \
-  --scan-npz si_trapezoid_1keV.npz \
-  --color-by energy \
-  --output left_sidewall_energy.gif
-```
-
-GIF and MP4 outputs are supported when the required Matplotlib writer is available.
-
-### Choosing `--trace-primaries`
-
-Start with:
-
-```bash
---trace-primaries 5
-```
-
-to inspect individual cascades clearly.
-
-For a richer visualization:
-
-```bash
---trace-primaries 10
-```
-
-to:
-
-```bash
---trace-primaries 20
-```
-
-is usually reasonable.
-
-Tracing hundreds or thousands of primaries is not recommended for animation because the plot becomes visually saturated and the trajectory buffer becomes large.
-
----
-
-# Main trapezoid outputs
-
-## CSV
-
-The CSV contains one row per raster pixel, including:
-
-- beam `x`;
-- nominal/local surface information;
-- TEY;
-- conventional SEY/BSEY;
-- Cascade all / Primary all;
-- SE1 / SE2;
-- generation-resolved channels;
-- LLE / non-LLE primary channels;
-- Monte Carlo SEMs;
-- elapsed time and throughput;
-- particle allocation;
-- transport diagnostics.
-
-Diagnostic counter names are kept separate from physical yield names, so the scalar `sey_50ev` field is the actual yield rather than the raw integer counter.
-
-## NPZ
-
-The line-scan NPZ stores arrays for all line-profile channels plus per-primary counts. Per-primary counts make covariance-aware signal combinations and metrology analysis possible later.
-
-## Trajectory NPZ
-
-A traced-pixel NPZ stores sparse event points only for selected root-primary lineages. It is intended for visualization and transport diagnostics, not as the main high-statistics simulation output.
-
----
-
-# Buffer and validity diagnostics
-
-A normal valid pixel should have:
-
-```text
-particle_overflow          False
-emission_buffer_overflow   0
-omega_cdf_empty            0
-q_cdf_empty                0
-step_limit_hit             0
-generation_limit_hit       0
-no_scattering_rate         0
-```
-
-`step_chunk_continuations` may be nonzero. It is a scheduling counter, not a physics failure.
-
-`q_window_clipped` may also be nonzero for rare kinematic edge cases. The current inelastic implementation retries the conditional `omega -> q` sample when a numerically empty conditional-q distribution is encountered. A surviving `q_cdf_empty` still invalidates the result and should be investigated.
-
----
-
-# Precision and backend notes
-
-During development the useful validation chain has been:
-
-```text
-Python SEEMC reference
-        ↓
-Taichi CPU f64
-        ↓
-Taichi CPU f32
-        ↓
-Taichi Metal f32
-```
-
-On the tested Apple Metal backend, `f64` is not supported, so use:
-
-```bash
---arch metal --precision f32
-```
-
-CPU `f64` remains useful as the closest accelerated numerical comparison to the Python reference.
-
----
-
-# Version roadmap
-
-- **v0.1** — structure-of-arrays particle pool and atomic cascade allocation.
-- **v0.2** — real elastic transport.
-- **v0.3** — real inelastic transport and secondary generation.
-- **v0.4** — standalone incoming/outgoing barrier physics.
-- **v0.5** — coupled planar TEY/SEY/BSEY solver.
-- **v0.6** — energy/angle sweeps and emission export.
-- **v0.6.1** — Python-reference emission export.
-- **v0.6.2** — robust retry for rare empty conditional-q draws.
-- **v0.7.0** — analytic Taichi trapezoidal line scan.
-- **v0.7.1** — trajectory recording and corrected line-scan serialization/labels.
-- **v0.7.2** — enhanced trajectory animation with lineage/generation/event/energy coloring and linked line-profile panel.
-
-Likely next steps are geometry parity validation against Python SEEMC, multi-line scenes, richer trajectory diagnostics, and eventually integration of the accelerated backend into the main imaging workflow.
-
----
-
-# Recommended first trapezoid workflow
-
-For a new user or new material:
-
-1. Validate the material with the planar solver.
-2. Run a low-statistics trapezoid smoke test.
-3. Verify that every raster pixel is valid.
-4. Increase primaries/pixel for the production line profile.
-5. Trace only a few primaries at representative locations such as top center, sidewall, and substrate.
-6. Use linked trajectory animations to understand why the signal changes near edges.
-7. Increase `--capacity` if the physical particle pool overflows; increase `--trajectory-capacity` only if the saved animation is truncated.
+- `--trace-all-pixels` or `--trace-every N` during the scan
+- `--frames-per-pixel` in `seemc-taichi-animate-scan`
+- `--max-points-per-pixel` and `--max-roots` to simplify busy movies
+- `--color-by lineage|generation|event|energy`
+- GIF (`.gif`) or MP4 (`.mp4`) output
