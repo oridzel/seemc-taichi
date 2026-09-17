@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .scan_archive import archive_from_scan
 from .sweep import result_is_valid
 
 
@@ -75,9 +76,15 @@ TRAJECTORY_EVENT_NAMES = {
     5: "spawn",
     6: "surface_hit",
     7: "internal_reflection",
+    8: "vacuum_surface_hit",
     9: "escape",
     10: "terminate",
+    11: "incoming_barrier_reflection",
+    12: "geometry_reentry",
 }
+
+_REST_ENERGY_EV = 510_998.95069
+_C_ANGSTROM_PER_FS = 2_997.92458
 
 
 def _emission_arrays(result: dict):
@@ -210,6 +217,8 @@ def run_line_scan(
     progress: bool = True,
     trajectory_pixels: set[int] | None = None,
     trace_n_primaries: int = 0,
+    trajectory_stride: int = 1,
+    trajectory_max_points: int | None = None,
 ) -> tuple[list[dict], dict[str, np.ndarray], dict[int, dict]]:
     """Run a normal-incidence one-dimensional trapezoidal line scan."""
     x_positions = np.asarray(x_positions_angstrom, dtype=float)
@@ -218,6 +227,11 @@ def run_line_scan(
     n = int(primaries_per_pixel)
     if n < 1:
         raise ValueError("primaries_per_pixel must be positive")
+    trajectory_stride = int(trajectory_stride)
+    if trajectory_stride < 1:
+        raise ValueError("trajectory_stride must be positive")
+    if trajectory_max_points is not None and int(trajectory_max_points) < 2:
+        raise ValueError("trajectory_max_points must be at least 2")
 
     rows: list[dict] = []
     per_primary: dict[str, list[np.ndarray]] = {name: [] for name in CHANNELS}
@@ -290,7 +304,13 @@ def run_line_scan(
             key = f"diag_{name}" if name in row else name
             row[key] = int(value)
         if trace_this_pixel:
-            trajectories[ix] = extract_trajectory_payload(result, pixel_id=ix, x_nm=row["x_nm"])
+            trajectories[ix] = extract_trajectory_payload(
+                result,
+                pixel_id=ix,
+                x_nm=row["x_nm"],
+                stride=trajectory_stride,
+                max_points=trajectory_max_points,
+            )
         rows.append(row)
 
         if progress:
@@ -312,28 +332,132 @@ def run_line_scan(
     return rows, per_primary_arrays, trajectories
 
 
-def extract_trajectory_payload(result: dict, *, pixel_id: int, x_nm: float) -> dict:
+def _flight_time_fs(distance_angstrom: float, energy_ev: float) -> float:
+    if distance_angstrom <= 0.0 or energy_ev <= 0.0:
+        return 0.0
+    gamma = 1.0 + float(energy_ev) / _REST_ENERGY_EV
+    beta2 = max(1.0 - 1.0 / (gamma * gamma), 0.0)
+    if beta2 <= 0.0:
+        return 0.0
+    return float(distance_angstrom) / (_C_ANGSTROM_PER_FS * math.sqrt(beta2))
+
+
+def _trajectory_times(result: dict) -> np.ndarray:
+    """Approximate physical time for every stored Taichi trajectory point.
+
+    Taichi records event states rather than clock time.  Free-flight time is
+    reconstructed from consecutive points and instantaneous energy.  A child
+    begins at the closest recorded point on its parent, which preserves the
+    causal cascade timing needed by the SEEMC-imaging style animation.
+    """
+    x = np.asarray(result["trajectory_x_angstrom"], dtype=float)
+    y = np.asarray(result["trajectory_y_angstrom"], dtype=float)
+    z = np.asarray(result["trajectory_z_angstrom"], dtype=float)
+    energy = np.asarray(result["trajectory_energy_ev"], dtype=float)
+    electron = np.asarray(result["trajectory_electron_id"], dtype=np.int64)
+    parent = np.asarray(result["trajectory_parent_id"], dtype=np.int64)
+    times = np.zeros(len(x), dtype=float)
+    if not len(x):
+        return times
+
+    indices_by_electron = {
+        int(eid): np.flatnonzero(electron == eid) for eid in np.unique(electron)
+    }
+    for eid in sorted(indices_by_electron):
+        indices = indices_by_electron[eid]
+        first = int(indices[0])
+        parent_id = int(parent[first])
+        birth_time = 0.0
+        if parent_id in indices_by_electron:
+            parent_indices = indices_by_electron[parent_id]
+            dx = x[parent_indices] - x[first]
+            dy = y[parent_indices] - y[first]
+            dz = z[parent_indices] - z[first]
+            nearest = int(parent_indices[np.argmin(dx * dx + dy * dy + dz * dz)])
+            birth_time = float(times[nearest])
+        times[first] = birth_time
+        for previous, current in zip(indices[:-1], indices[1:]):
+            distance = math.sqrt(
+                (x[current] - x[previous]) ** 2
+                + (y[current] - y[previous]) ** 2
+                + (z[current] - z[previous]) ** 2
+            )
+            segment_energy = max(float(energy[previous]), float(energy[current]), 0.0)
+            times[current] = times[previous] + _flight_time_fs(
+                distance, segment_energy
+            )
+    return times
+
+
+def _decimation_indices(
+    electron_id: np.ndarray,
+    *,
+    stride: int,
+    max_points: int | None,
+) -> np.ndarray:
+    keep = []
+    for eid in np.unique(electron_id):
+        indices = np.flatnonzero(electron_id == eid)
+        selected = indices[::stride]
+        if len(indices) and (not len(selected) or selected[-1] != indices[-1]):
+            selected = np.append(selected, indices[-1])
+        if max_points is not None and len(selected) > int(max_points):
+            positions = np.rint(
+                np.linspace(0, len(selected) - 1, int(max_points))
+            ).astype(int)
+            selected = selected[np.unique(positions)]
+        keep.extend(int(value) for value in selected)
+    return np.asarray(sorted(keep), dtype=np.int64)
+
+
+def extract_trajectory_payload(
+    result: dict,
+    *,
+    pixel_id: int,
+    x_nm: float,
+    stride: int = 1,
+    max_points: int | None = None,
+) -> dict:
     if "trajectory_x_angstrom" not in result:
         raise ValueError("result does not contain copied trajectories")
-    return {
+    electron = np.asarray(result["trajectory_electron_id"], dtype=np.int32)
+    indices = _decimation_indices(
+        electron, stride=int(stride), max_points=max_points
+    )
+    times = _trajectory_times(result)
+    trace_n = int(result.get("trace_n_primaries", 0))
+    emission_roots = np.asarray(result["emission_root_primary_id"], dtype=np.int32)
+    emission_keep = emission_roots < trace_n
+    payload = {
         "pixel_id": int(pixel_id),
         "x_nm": float(x_nm),
-        "trace_n_primaries": int(result.get("trace_n_primaries", 0)),
+        "trace_n_primaries": trace_n,
+        "trajectory_overflow": bool(result.get("trajectory_overflow", False)),
         "trajectory_event_names_json": json.dumps(TRAJECTORY_EVENT_NAMES, sort_keys=True),
         "trajectory_surface_names_json": json.dumps(SURFACE_NAMES, sort_keys=True),
-        "trajectory_x_angstrom": np.asarray(result["trajectory_x_angstrom"], dtype=float),
-        "trajectory_y_angstrom": np.asarray(result["trajectory_y_angstrom"], dtype=float),
-        "trajectory_z_angstrom": np.asarray(result["trajectory_z_angstrom"], dtype=float),
-        "trajectory_energy_ev": np.asarray(result["trajectory_energy_ev"], dtype=float),
-        "trajectory_electron_id": np.asarray(result["trajectory_electron_id"], dtype=np.int32),
-        "trajectory_parent_id": np.asarray(result["trajectory_parent_id"], dtype=np.int32),
-        "trajectory_root_primary_id": np.asarray(result["trajectory_root_primary_id"], dtype=np.int32),
-        "trajectory_generation": np.asarray(result["trajectory_generation"], dtype=np.int32),
-        "trajectory_inelastic_count": np.asarray(result["trajectory_inelastic_count"], dtype=np.int32),
-        "trajectory_event": np.asarray(result["trajectory_event"], dtype=np.int32),
-        "trajectory_surface_code": np.asarray(result["trajectory_surface_code"], dtype=np.int32),
-        "trajectory_step": np.asarray(result["trajectory_step"], dtype=np.int32),
+        "trajectory_x_angstrom": np.asarray(result["trajectory_x_angstrom"], dtype=float)[indices],
+        "trajectory_y_angstrom": np.asarray(result["trajectory_y_angstrom"], dtype=float)[indices],
+        "trajectory_z_angstrom": np.asarray(result["trajectory_z_angstrom"], dtype=float)[indices],
+        "trajectory_energy_ev": np.asarray(result["trajectory_energy_ev"], dtype=float)[indices],
+        "trajectory_time_fs": times[indices],
+        "trajectory_electron_id": electron[indices],
+        "trajectory_parent_id": np.asarray(result["trajectory_parent_id"], dtype=np.int32)[indices],
+        "trajectory_root_primary_id": np.asarray(result["trajectory_root_primary_id"], dtype=np.int32)[indices],
+        "trajectory_generation": np.asarray(result["trajectory_generation"], dtype=np.int32)[indices],
+        "trajectory_inelastic_count": np.asarray(result["trajectory_inelastic_count"], dtype=np.int32)[indices],
+        "trajectory_event": np.asarray(result["trajectory_event"], dtype=np.int32)[indices],
+        "trajectory_surface_code": np.asarray(result["trajectory_surface_code"], dtype=np.int32)[indices],
+        "trajectory_step": np.asarray(result["trajectory_step"], dtype=np.int32)[indices],
+        "emission_electron_id": np.asarray(result["emission_electron_id"], dtype=np.int32)[emission_keep],
+        "emission_root_primary_id": emission_roots[emission_keep],
+        "emission_energy_ev": np.asarray(result["emission_energy_ev"], dtype=float)[emission_keep],
+        "emission_ux": np.asarray(result["emission_ux"], dtype=float)[emission_keep],
+        "emission_uy": np.asarray(result["emission_uy"], dtype=float)[emission_keep],
+        "emission_uz": np.asarray(result["emission_uz"], dtype=float)[emission_keep],
+        "emission_generation": np.asarray(result["emission_generation"], dtype=np.int32)[emission_keep],
+        "emission_inelastic_count": np.asarray(result["emission_inelastic_count"], dtype=np.int32)[emission_keep],
     }
+    return payload
 
 
 def save_trajectory_npz(path: str | Path, trajectory: dict, *, metadata: dict | None = None) -> Path:
@@ -344,6 +468,18 @@ def save_trajectory_npz(path: str | Path, trajectory: dict, *, metadata: dict | 
         payload["metadata_json"] = np.asarray(json.dumps(metadata, sort_keys=True))
     np.savez_compressed(path, **payload)
     return path
+
+
+def save_trajectory_archive_npz(
+    path: str | Path,
+    rows: list[dict],
+    trajectories: dict[int, dict],
+    *,
+    metadata: dict,
+) -> Path:
+    """Save all recorded scan pixels and profiles to one animation archive."""
+    archive = archive_from_scan(rows, trajectories, metadata=metadata)
+    return archive.save_npz(path)
 
 
 def save_scan_csv(path: str | Path, rows: list[dict]) -> Path:

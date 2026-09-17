@@ -47,6 +47,39 @@ def test_nominal_local_incidence():
     assert math.isclose(angle, expected, rel_tol=0, abs_tol=1e-12)
 
 
+def test_centered_three_line_array_and_neighbor_hit():
+    g = TrapezoidGeometryConfig(
+        top_width=500.0,
+        bottom_width=700.0,
+        height=500.0,
+        n_lines=3,
+        pitch=1000.0,
+    ).validate()
+    assert g.line_centers == (-1000.0, 0.0, 1000.0)
+    assert g.span == 2700.0
+
+    # Every line center launches on a top face; the midpoint of a trench is
+    # exposed substrate.
+    for center in g.line_centers:
+        z, nx, nz, code = g.launch_surface(center)
+        assert (z, nx, nz, code) == (-500.0, 0.0, -1.0, 1)
+    assert g.launch_surface(-500.0) == (0.0, 0.0, -1.0, 4)
+
+    # A lateral vacuum ray leaving the right wall of the left line reaches the
+    # left wall of the central line.  This is the interaction the old
+    # one-trapezoid Taichi geometry missed.
+    hit = g.first_vacuum_hit(-650.0, -250.0, 1.0, 0.0)
+    assert hit is not None
+    distance, nx, nz, code, line_index = hit
+    assert math.isclose(distance, 350.0, rel_tol=0, abs_tol=1e-12)
+    assert line_index == 1
+    assert code == 3
+    assert nx < 0.0 and nz < 0.0
+
+    # A ray travelling away from the complete structure escapes.
+    assert g.first_vacuum_hit(0.0, -500.0, 0.0, -1.0) is None
+
+
 def synthetic_result():
     # 4 primaries, 8 emissions.  Cascade entries deliberately exercise the
     # current rule: only generation=1 with own inelastic_count=0 is SE1.

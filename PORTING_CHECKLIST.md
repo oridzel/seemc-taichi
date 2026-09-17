@@ -79,5 +79,20 @@
 - [ ] Taichi JIT compile test on Apple Metal
 - [ ] center/top, sidewall, and substrate pixel parity against Python SEEMC
 - [ ] full 201-pixel Python-vs-Taichi profile validation
-- [ ] trajectory recording/animation backend
-- [ ] multi-line array and suspended-line backends
+- [x] sparse event-level trajectory recording
+- [x] combined whole-scan trajectory archive and animation backend
+- [x] centered multi-line array geometry
+- [x] vacuum flight, neighbouring-line/substrate interception, and solid re-entry
+- [ ] suspended-line backend
+
+## v0.8 SEEMC-imaging line-scan parity
+
+- [x] `n_lines`, `pitch`, centered `line_centers`, and automatic array span
+- [x] one-row field width defaults to array span + 80 nm
+- [x] trajectories enabled by default for a subset of roots at every pixel
+- [x] one `PREFIX.trajectories.npz` archive containing profiles and all pixels
+- [x] full-scan moving-beam animation with physical-time reconstruction
+- [x] energy or population colors, fading tails, and synthetic vacuum flight
+- [x] default Full SE / Full BSE / Total measured profile panel
+- [x] same-color line/substrate rendering without buried base boundaries
+- [ ] quantitative multi-line profile parity against Python SEEMC

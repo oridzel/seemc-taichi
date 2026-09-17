@@ -8,6 +8,7 @@ from .bulk import BulkPhysicsConfig, BulkTransportEngine
 from .plane import PlaneTransportEngine, load_reference_plane_tables
 from .surface import SurfacePhysicsConfig
 from .trapezoid import TrapezoidGeometryConfig, TrapezoidTransportEngine
+from .scan_archive import RasterTrajectoryArchive
 
 __all__ = [
     "BackendConfig",
@@ -18,6 +19,7 @@ __all__ = [
     "SurfacePhysicsConfig",
     "TrapezoidGeometryConfig",
     "TrapezoidTransportEngine",
+    "RasterTrajectoryArchive",
     "HostMaterialTables",
     "YieldStats",
     "compare_yields",
@@ -25,4 +27,4 @@ __all__ = [
     "init_taichi",
 ]
 
-__version__ = "0.7.3"
+__version__ = "0.8.0"

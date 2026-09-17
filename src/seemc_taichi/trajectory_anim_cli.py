@@ -14,8 +14,11 @@ EVENT_NAMES = {
     5: "spawn",
     6: "surface hit",
     7: "internal reflection",
+    8: "vacuum surface hit",
     9: "escape",
     10: "terminate",
+    11: "incoming barrier reflection",
+    12: "geometry re-entry",
 }
 
 LINEAGE_NAMES = {

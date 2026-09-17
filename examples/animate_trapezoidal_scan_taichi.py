@@ -1,4 +1,4 @@
-"""Animate the complete Taichi trapezoidal line scan."""
+"""SEEMC-imaging compatible whole-scan animation entry point."""
 
 from seemc_taichi.scan_anim_cli import main
 
