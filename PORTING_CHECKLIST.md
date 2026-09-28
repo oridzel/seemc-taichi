@@ -50,7 +50,7 @@
 - [ ] accelerated planar sampler-library API.
 - [ ] joint E/theta/phi export matching current sampler schema.
 - [ ] trapezoid/scene intersection backend.
-- [ ] accelerated raster/image batches.
+- [x] accelerated raster/image batches.
 - [ ] production Python-vs-Taichi CPU-vs-GPU benchmark suite.
 
 ## v0.6 sweep/validation tooling
@@ -96,3 +96,14 @@
 - [x] default Full SE / Full BSE / Total measured profile panel
 - [x] same-color line/substrate rendering without buried base boundaries
 - [ ] quantitative multi-line profile parity against Python SEEMC
+
+## v0.8.1 two-dimensional raster imaging
+
+- [x] independent deterministic x-y pixel ensembles with row-major IDs
+- [x] `--nx`, `--ny`, `--field-width-nm`, and `--field-height-nm`
+- [x] no trajectory allocation or archive for two-dimensional images
+- [x] self-describing `(ny, nx)` yield, SEM, count, validity, and launch maps
+- [x] flat CSV with `pixel_id`, `iy`, `ix`, x, and y coordinates
+- [x] configurable multi-channel heatmap overview
+- [x] backward-compatible `--pixels` alias and one-row NPZ keys
+- [ ] quantitative x-y raster parity against Python SEEMC

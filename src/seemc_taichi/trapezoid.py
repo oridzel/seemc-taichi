@@ -1,7 +1,8 @@
-"""Taichi transport for raised trapezoidal SEM lines on a bulk substrate.
+"""Taichi transport for supported or suspended trapezoidal SEM lines.
 
-Coordinates follow seemc-imaging: vacuum is toward negative z, the substrate
-occupies z >= 0, and each trapezoidal line occupies -height <= z <= 0.  Lines
+Coordinates follow seemc-imaging: the incident beam travels toward positive z.
+Each line occupies -height <= z <= 0. A bulk substrate occupies z >= 0 unless
+geometry.suspended is true, in which case the bottom is a solid/vacuum surface. Lines
 are infinite along y.  Every solid transport leg is truncated at the first
 exposed solid/vacuum boundary before collision physics is applied.  A particle
 that leaves one face is followed through vacuum and may enter another line (or
@@ -26,7 +27,7 @@ A0_ANG = 0.529177
 
 @dataclass(frozen=True)
 class TrapezoidGeometryConfig:
-    """A centered array of trapezoidal lines on a substrate, in Angstrom.
+    """A centered array of supported or suspended trapezoidal lines, in Angstrom.
 
     ``center_x`` is the center of the complete array.  For ``n_lines > 1`` the
     individual line centers are separated by ``pitch`` and are symmetric about
@@ -40,6 +41,7 @@ class TrapezoidGeometryConfig:
     center_x: float = 0.0
     n_lines: int = 1
     pitch: float | None = None
+    suspended: bool = False
 
     def validate(self):
         vals = tuple(
@@ -105,7 +107,7 @@ class TrapezoidGeometryConfig:
                 nx = h / norm if dx >= 0 else -h / norm
                 nz = -(b - a) / norm
                 return z, nx, nz, 2 if dx >= 0 else 3
-        return 0.0, 0.0, -1.0, 4
+        return 0.0, 0.0, -1.0, 0 if self.suspended else 4
 
     def first_vacuum_hit(self, x, z, ux, uz, *, epsilon=1.0e-9):
         """Return the next vacuum-to-solid hit for a two-dimensional ray.
@@ -159,7 +161,13 @@ class TrapezoidGeometryConfig:
                         -h - eps <= z_hit <= eps,
                     )
 
-        if uz > eps:
+        if self.suspended and uz < -eps:
+            distance = -z / uz
+            x_hit = x + distance * ux
+            for line_index, center in enumerate(self.line_centers):
+                consider(distance, 0.0, 1.0, 5, line_index,
+                         abs(x_hit - center) <= b + eps)
+        if not self.suspended and uz > eps:
             distance = -z / uz
             x_hit = x + distance * ux
             covered = any(
@@ -213,7 +221,7 @@ class TrapezoidEmissionBuffer:
         # 1 = ordinary transport escape; 2 = incoming-barrier reflection.
         self.mechanism = ti.field(dtype=ti.i32, shape=self.capacity)
         self.inelastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
-        # 1 top, 2 right wall, 3 left wall, 4 substrate.
+        # 0 vacuum miss, 1 top, 2 right wall, 3 left wall, 4 substrate, 5 bottom.
         self.surface_code = ti.field(dtype=ti.i32, shape=self.capacity)
 
 
@@ -284,6 +292,7 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
     barrier_classical = surface_model == "classical"
     barrier_abrupt = surface_model == "abrupt"
     bse_cutoff = float(bse_cutoff_ev)
+    suspended = bool(geometry.suspended)
     geom_a = 0.5 * float(geometry.top_width)
     geom_b = 0.5 * float(geometry.bottom_width)
     geom_h = float(geometry.height)
@@ -791,6 +800,8 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
         nx = fp(0.0)
         nz = fp(-1.0)
         code = ti.i32(4)
+        if ti.static(suspended):
+            code = ti.i32(0)
         found = ti.i32(0)
         for line_index in ti.static(range(geom_n_lines)):
             center = (
@@ -889,27 +900,45 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
                             nz_best = fp(left_nz)
                             code = ti.i32(3)
 
-        # Exposed substrate z=0 only outside the buried trapezoid base.
-        if uz < fp(-1.0e-15):
-            t = -z / uz
-            if t >= fp(-geom_eps) and t <= max_distance + fp(geom_eps):
-                xh = x + t * ux
-                covered = ti.i32(0)
-                for line_index in ti.static(range(geom_n_lines)):
-                    center = (
-                        fp(geom_cx - 0.5 * float(geom_n_lines - 1) * geom_pitch)
-                        + ti.cast(line_index, fp) * fp(geom_pitch)
-                    )
-                    if ti.abs(xh - center) < fp(geom_b - geom_eps):
-                        covered = ti.i32(1)
-                if covered == ti.i32(0):
-                    tt = ti.max(t, fp(0.0))
-                    if tt < best:
-                        hit = ti.i32(1)
-                        best = tt
-                        nx_best = fp(0.0)
-                        nz_best = fp(-1.0)
-                        code = ti.i32(4)
+        if ti.static(suspended):
+            # Bottom face: finite solid ends at z=0; outward normal +z.
+            if uz > fp(1.0e-15):
+                t = -z / uz
+                if t >= fp(-geom_eps) and t <= max_distance + fp(geom_eps):
+                    xh = x + t * ux
+                    for line_index in ti.static(range(geom_n_lines)):
+                        center = (fp(geom_cx - 0.5 * float(geom_n_lines - 1) * geom_pitch)
+                                  + ti.cast(line_index, fp) * fp(geom_pitch))
+                        if ti.abs(xh - center) <= fp(geom_b + geom_eps):
+                            tt = ti.max(t, fp(0.0))
+                            if tt < best:
+                                hit = ti.i32(1)
+                                best = tt
+                                nx_best = fp(0.0)
+                                nz_best = fp(1.0)
+                                code = ti.i32(5)
+        else:
+            # Exposed substrate z=0 only outside the buried trapezoid base.
+            if uz < fp(-1.0e-15):
+                t = -z / uz
+                if t >= fp(-geom_eps) and t <= max_distance + fp(geom_eps):
+                    xh = x + t * ux
+                    covered = ti.i32(0)
+                    for line_index in ti.static(range(geom_n_lines)):
+                        center = (
+                            fp(geom_cx - 0.5 * float(geom_n_lines - 1) * geom_pitch)
+                            + ti.cast(line_index, fp) * fp(geom_pitch)
+                        )
+                        if ti.abs(xh - center) < fp(geom_b - geom_eps):
+                            covered = ti.i32(1)
+                    if covered == ti.i32(0):
+                        tt = ti.max(t, fp(0.0))
+                        if tt < best:
+                            hit = ti.i32(1)
+                            best = tt
+                            nx_best = fp(0.0)
+                            nz_best = fp(-1.0)
+                            code = ti.i32(4)
         return hit, best, nx_best, nz_best, code
 
     @ti.func
@@ -979,25 +1008,41 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
                         nz_best = fp(left_nz)
                         code = ti.i32(3)
 
-        # Exposed substrate, excluding every buried line base.
-        if uz > fp(1.0e-15):
-            t = -z / uz
-            if t > fp(geom_eps):
-                xh = x + t * ux
-                covered = ti.i32(0)
-                for line_index in ti.static(range(geom_n_lines)):
-                    center = (
-                        fp(geom_cx - 0.5 * float(geom_n_lines - 1) * geom_pitch)
-                        + ti.cast(line_index, fp) * fp(geom_pitch)
-                    )
-                    if ti.abs(xh - center) < fp(geom_b - geom_eps):
-                        covered = ti.i32(1)
-                if covered == ti.i32(0) and t < best:
-                    hit = ti.i32(1)
-                    best = t
-                    nx_best = fp(0.0)
-                    nz_best = fp(-1.0)
-                    code = ti.i32(4)
+        if ti.static(suspended):
+            # Approach underside from the vacuum below the membrane.
+            if uz < fp(-1.0e-15):
+                t = -z / uz
+                if t > fp(geom_eps):
+                    xh = x + t * ux
+                    for line_index in ti.static(range(geom_n_lines)):
+                        center = (fp(geom_cx - 0.5 * float(geom_n_lines - 1) * geom_pitch)
+                                  + ti.cast(line_index, fp) * fp(geom_pitch))
+                        if ti.abs(xh - center) <= fp(geom_b + geom_eps) and t < best:
+                            hit = ti.i32(1)
+                            best = t
+                            nx_best = fp(0.0)
+                            nz_best = fp(1.0)
+                            code = ti.i32(5)
+        else:
+            # Exposed substrate, excluding every buried line base.
+            if uz > fp(1.0e-15):
+                t = -z / uz
+                if t > fp(geom_eps):
+                    xh = x + t * ux
+                    covered = ti.i32(0)
+                    for line_index in ti.static(range(geom_n_lines)):
+                        center = (
+                            fp(geom_cx - 0.5 * float(geom_n_lines - 1) * geom_pitch)
+                            + ti.cast(line_index, fp) * fp(geom_pitch)
+                        )
+                        if ti.abs(xh - center) < fp(geom_b - geom_eps):
+                            covered = ti.i32(1)
+                    if covered == ti.i32(0) and t < best:
+                        hit = ti.i32(1)
+                        best = t
+                        nx_best = fp(0.0)
+                        nz_best = fp(-1.0)
+                        code = ti.i32(4)
         return hit, best, nx_best, nz_best, code
 
     @ti.func
@@ -1346,38 +1391,49 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
             samples.secondary_valid[i] = ti.i32(0)
             samples.secondary_energy[i] = fp(0.0)
 
-            # Normal incident beam d=(0,0,+1).  Local normal is solid->vacuum.
-            Eperp_vac = energy_vac_ev * nz * nz
-            Tin = incoming_T(Eperp_vac)
-            ti.atomic_add(counters.incoming_barrier_encounters[None], ti.i32(1))
-            reflected = ti.i32(0)
-            if Tin < fp(1.0) and ti.random(fp) >= Tin:
-                reflected = ti.i32(1)
-
-            if reflected == ti.i32(1):
-                rx, ry, rz = reflect_about_normal(fp(0.0), fp(0.0), fp(1.0), nx, nz)
-                pool.ux[i] = rx
-                pool.uy[i] = ry
-                pool.uz[i] = rz
+            if surf_code == ti.i32(0):
+                # Missed the entire suspended array. This is direct beam,
+                # not specimen emission; retain it only in launch metadata.
+                pool.ux[i] = fp(0.0)
+                pool.uy[i] = fp(0.0)
+                pool.uz[i] = fp(1.0)
                 pool.energy[i] = energy_vac_ev
-                record_trajectory(i, ti.i32(1), surf_code)
-                ti.atomic_add(counters.incoming_barrier_reflections[None], ti.i32(1))
-                record_trajectory(i, ti.i32(11), surf_code)
-                reentered = follow_vacuum(
-                    i, energy_vac_ev, ti.i32(2), surf_code
-                )
-                pool.alive[i] = reentered
+                pool.alive[i] = ti.i32(0)
+                record_trajectory(i, ti.i32(1), ti.i32(0))
+                record_trajectory(i, ti.i32(13), ti.i32(0))
             else:
-                E_s, sx, sy, sz = transmit_incoming(
-                    fp(0.0), fp(0.0), fp(1.0), energy_vac_ev, nx, nz
-                )
-                pool.ux[i] = sx
-                pool.uy[i] = sy
-                pool.uz[i] = sz
-                pool.energy[i] = E_s
-                pool.alive[i] = ti.i32(1)
-                record_trajectory(i, ti.i32(1), surf_code)
-                ti.atomic_add(counters.incoming_barrier_transmissions[None], ti.i32(1))
+                # Normal incident beam d=(0,0,+1).  Local normal is solid->vacuum.
+                Eperp_vac = energy_vac_ev * nz * nz
+                Tin = incoming_T(Eperp_vac)
+                ti.atomic_add(counters.incoming_barrier_encounters[None], ti.i32(1))
+                reflected = ti.i32(0)
+                if Tin < fp(1.0) and ti.random(fp) >= Tin:
+                    reflected = ti.i32(1)
+
+                if reflected == ti.i32(1):
+                    rx, ry, rz = reflect_about_normal(fp(0.0), fp(0.0), fp(1.0), nx, nz)
+                    pool.ux[i] = rx
+                    pool.uy[i] = ry
+                    pool.uz[i] = rz
+                    pool.energy[i] = energy_vac_ev
+                    record_trajectory(i, ti.i32(1), surf_code)
+                    ti.atomic_add(counters.incoming_barrier_reflections[None], ti.i32(1))
+                    record_trajectory(i, ti.i32(11), surf_code)
+                    reentered = follow_vacuum(
+                        i, energy_vac_ev, ti.i32(2), surf_code
+                    )
+                    pool.alive[i] = reentered
+                else:
+                    E_s, sx, sy, sz = transmit_incoming(
+                        fp(0.0), fp(0.0), fp(1.0), energy_vac_ev, nx, nz
+                    )
+                    pool.ux[i] = sx
+                    pool.uy[i] = sy
+                    pool.uz[i] = sz
+                    pool.energy[i] = E_s
+                    pool.alive[i] = ti.i32(1)
+                    record_trajectory(i, ti.i32(1), surf_code)
+                    ti.atomic_add(counters.incoming_barrier_transmissions[None], ti.i32(1))
 
     @ti.kernel
     def force_one_inelastic(n: ti.i32):
@@ -1568,16 +1624,20 @@ class TrapezoidTransportEngine:
         surface_codes = np.empty(n, dtype=np.int32)
         for j, xj in enumerate(xs):
             zj, _nxj, nzj, codej = self.geometry.launch_surface(float(xj))
-            zvals[j] = zj
+            zvals[j] = zj if codej != 0 else math.nan
             surface_codes[j] = int(codej)
-            inc[j] = math.degrees(math.acos(max(-1.0, min(1.0, -float(nzj)))))
+            inc[j] = (math.degrees(math.acos(max(-1.0, min(1.0, -float(nzj)))))
+                      if codej != 0 else math.nan)
+        hit_mask = surface_codes != 0
+        n_hit = int(hit_mask.sum())
         return {
             "launch_mean_x_angstrom": float(np.mean(xs)),
             "launch_mean_y_angstrom": float(np.mean(ys)),
-            "launch_surface_z_mean_angstrom": float(np.mean(zvals)),
-            "local_incidence_mean_deg": float(np.mean(inc)),
+            "launch_surface_z_mean_angstrom": float(np.mean(zvals[hit_mask])) if n_hit else math.nan,
+            "local_incidence_mean_deg": float(np.mean(inc[hit_mask])) if n_hit else math.nan,
             "local_incidence_sem_deg": (
-                0.0 if n < 2 else float(np.std(inc, ddof=0) / math.sqrt(n))
+                (0.0 if n_hit == 1 else float(np.std(inc[hit_mask], ddof=0) / math.sqrt(n_hit)))
+                if n_hit else math.nan
             ),
             "launch_surface_codes": surface_codes,
         }
@@ -1712,6 +1772,8 @@ class TrapezoidTransportEngine:
             "launch_surface_z_mean_angstrom": launch_meta["launch_surface_z_mean_angstrom"],
             "local_incidence_mean_deg": launch_meta["local_incidence_mean_deg"],
             "local_incidence_sem_deg": launch_meta["local_incidence_sem_deg"],
+            "launch_surface_codes": launch_meta["launch_surface_codes"],
+            "gap_primary_fraction": float(np.mean(launch_meta["launch_surface_codes"] == 0)),
             "trace_n_primaries": int(max(0, int(trace_n_primaries))),
         }
         if copy_emissions:

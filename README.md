@@ -1,3 +1,9 @@
+# v0.9.2: suspended Si lines
+
+Use `--suspended` for finite lines with vacuum below and between them.
+See [SUSPENDED_SI.md](SUSPENDED_SI.md) for installation, commands at 900 eV and
+30 keV, signal definitions, and geometry assumptions.
+
 # seemc-taichi
 
 Experimental Taichi acceleration backend for SEEMC. It remains separate from
@@ -32,7 +38,7 @@ as immediate primary emissions, matching current Python SEEMC accounting.
 ## Install
 
 ```bash
-python3 -m pip install -e '.[reference,test]'
+python3 -m pip install -e '.[reference,test,psf]'
 python3 -m pytest -q
 ```
 
@@ -144,9 +150,110 @@ benchmark calls `ti.sync()` before stopping the timer.
 - **v0.5:** coupled planar transport + TEY/SEY/BSEY + emission buffer — complete.
 - **v0.6:** reusable planar sweeps and reference-emission export — complete.
 - **v0.7:** one-line trapezoidal scan and diagnostic trajectories — complete.
-- **v0.8:** SEEMC-imaging-compatible multi-line scan/archive/animation — current.
+- **v0.8.1:** SEEMC-imaging-compatible multi-line scan, 2D raster, and animation — complete.
+- **v0.9.0:** collision-history-resolved planar point-spread functions — complete.
+- **v0.9.1:** refined mechanism populations, SE1/SE2 comparison, and seed-radius/depth maps — current.
 - **next:** complete production Python-vs-Taichi parity maps and add a
   sampler-compatible accelerated batch API.
+
+## v0.9.1: planar point-spread functions by scattering population
+
+The planar backend now copies the surface exit position, birth position, and
+four collision counters into every emission record:
+
+- elastic and inelastic collisions experienced by the emitted electron itself;
+- elastic and inelastic collisions along its causal path from the root primary.
+
+This makes the raw NPZ reusable. Population definitions, the 50 eV split,
+radial bins, and finite beam convolution can all be changed later without
+rerunning transport.
+
+Run a 10 keV normal-incidence point beam on Si and create the raw event archive,
+population table, radial-PSF table, standard PSF figure, mechanism-detail
+figure, and seed-radius/depth outputs:
+
+```bash
+seemc-taichi-plane-psf run ../MaterialDatabase.pkl \
+  --material Si \
+  --energy-ev 10000 \
+  --angle-deg 0 \
+  --arch metal \
+  --precision f32 \
+  --n 1000000 \
+  --batch-size 10000 \
+  --capacity 1000000 \
+  --output-prefix si_10keV_point_psf
+```
+
+The point-beam archive is the fundamental result. For a planar sample, a
+finite beam can be applied exactly as a translation convolution during
+post-processing. The attached radial-profile exercise states a circular
+Gaussian with `sigma = 1 nm`:
+
+```bash
+seemc-taichi-plane-psf plot si_10keV_point_psf_events.npz \
+  --beam-sigma-nm 1 \
+  --min-count-per-bin 10 \
+  --output-prefix si_10keV_sigma1nm_psf
+```
+
+Each analysis writes six files:
+
+- `*_population_summary.csv` — yields, family fractions, counting uncertainty,
+  energies, and radial quantiles for every classification;
+- `*_radial_psf.csv` — all raw annular counts, PSFs, Poisson SEMs, and relative
+  Poisson SEMs;
+- `*_radial_psf.png` — the standard SE, BSE, combined, and encircled plots;
+- `*_mechanism_detail.png` — current SE1/SE2, multiple-origin SE, and other-BSE
+  decompositions;
+- `*_seed_radius_depth_summary.csv` — birth-radius/depth quantiles and shallow,
+  far-field fractions for SE populations; and
+- `*_seed_radius_depth.png` — four density maps comparing origin-based and
+  current-rule SE populations.
+
+The CSV retains every radial bin. By default, figures show a population curve
+only where an annulus contains at least 10 events, corresponding to a Poisson
+relative SEM of at most about 32%. Use `--min-count-per-bin 1` to reproduce the
+older unsuppressed curves or raise the threshold for publication figures.
+
+The default population rules are explicit:
+
+- `se_single_inelastic_origin`: a generation-1 SE born in the first inelastic
+  collision of a primary with no prior elastic collision. The emitted SE may
+  scatter afterward.
+- `se_strict_single_inelastic`: the preceding population restricted to SEs
+  that escape without a collision of their own.
+- `bse_single_elastic`: an escaping primary with exactly one elastic and zero
+  inelastic collisions.
+- `bse_plural_elastic_only`: an escaping primary with two or more elastic and
+  zero inelastic collisions.
+- `bse_elastic_plus_inelastic`: an escaping primary with at least one of each
+  collision type.
+
+The multiple-origin SE remainder is further partitioned into generation-1 SEs
+created after parent elastic scattering, generation-1 SEs created after prior
+primary inelastic scattering, generation >=2 SEs, and low-energy emitted
+primaries. `bse_other` is split into high-energy cascade electrons,
+inelastic-only primary paths, no-collision primary paths, and an explicit
+unclassified residual.
+
+The mechanism-detail figure keeps the imaging definition separate from the
+origin definition. Current SE1 is `generation == 1` with zero inelastic
+collisions experienced by that secondary after creation; current SE2 is the
+remaining conventional SE population. The population table also includes the
+four intersections between current SE1/SE2 and single/multiple origin.
+
+Seed coordinates always remain relative to the point impact. Gaussian beam
+convolution changes the emission PSF during post-processing but does not alter
+the saved intrinsic birth-radius/depth distributions.
+
+Direct incoming-barrier reflections are stored and plotted separately. The
+combined single/multiple curves exclude those untransported reflections.
+
+The database and `seemc-imaging` installation must be from the same current
+model generation. A database whose elastic and inelastic arrays have different
+energy-grid lengths is rejected before transport; replace it with the matching
+current `MaterialDatabase.pkl` rather than padding or truncating physics tables.
 
 ## v0.6 batch planar yield sweeps
 
@@ -225,7 +332,7 @@ is encountered.  `q_cdf_empty` is incremented only if all retries fail.  This
 is intended for extremely rare f32/table-interpolation edge cases and does not
 change ordinary events.
 
-## v0.8.0: SEEMC-imaging-compatible trapezoidal line scan
+## v0.8.1: SEEMC-imaging-compatible trapezoidal scans and rasters
 
 v0.8 changes the Taichi workflow to match the established `seemc-imaging`
 example scripts. The geometry can contain one or more identical trapezoidal
@@ -243,7 +350,7 @@ The coordinate convention remains:
 - the substrate begins at `z=0`; and
 - every line is infinite along y.
 
-### Run a multi-line scan
+### Run an animation-ready multi-line scan
 
 This example is the Taichi equivalent of `trapezoidal_line_scan.py` in
 `seemc-imaging`:
@@ -259,8 +366,8 @@ seemc-taichi-trapezoid ../MaterialDatabase.pkl \
   --height-nm 50 \
   --n-lines 3 \
   --pitch-nm 100 \
-  --pixels 201 \
-  --trajectories 1000 \
+  --nx 201 \
+  --primaries-per-pixel 1000 \
   --beam-fwhm-nm 2 \
   --record-primaries-per-pixel 10 \
   --capacity 500000 \
@@ -297,10 +404,64 @@ Use `--record-all-trajectories` to retain every root or
 data while preserving each electron's endpoints. `--beam-fwhm-nm` controls the
 Gaussian beam spot; use zero for the historical point beam.
 
-The v0.7 names `--primaries-per-pixel`, `--scan-width-nm`, and
-`--output-prefix` remain accepted as aliases. Sparse diagnostic recording via
+The v0.7 names `--pixels`, `--primaries-per-pixel`, `--scan-width-nm`, and
+`--output-prefix` remain accepted as aliases (`--pixels` is an alias for
+`--nx`). Sparse diagnostic recording via
 `--trace-pixel`, `--trace-x-nm`, or `--trace-every` also remains available, but
 the normal animation-ready workflow records every pixel.
+
+### Generate a two-dimensional x-y image
+
+v0.8.1 adds a true two-dimensional raster. Each x-y pixel runs an independent
+ensemble of primaries, using a deterministic row-major pixel seed. Trajectory
+recording is disabled for `--ny > 1`, so image calculations do not retain or
+write animation data.
+
+```bash
+seemc-taichi-trapezoid ../MaterialDatabase.pkl \
+  --material Si \
+  --arch metal \
+  --precision f32 \
+  --energy-ev 1000 \
+  --top-width-nm 50 \
+  --bottom-width-nm 70 \
+  --height-nm 50 \
+  --n-lines 3 \
+  --pitch-nm 100 \
+  --nx 201 \
+  --ny 101 \
+  --field-width-nm 350 \
+  --field-height-nm 100 \
+  --primaries-per-pixel 1000 \
+  --beam-fwhm-nm 2 \
+  --capacity 500000 \
+  --no-record-trajectories \
+  --output three_lines_raster.csv \
+  --plot
+```
+
+This writes:
+
+- `three_lines_raster.csv` — one row per pixel, including `ix`, `iy`, x, y,
+  yields, SEMs, landing diagnostics, validity, and performance diagnostics;
+- `three_lines_raster.npz` — self-describing `(ny, nx)` yield, SEM, and total
+  count maps; and
+- `three_lines_raster.png` — a 3-by-3 overview of Full SE, Full BSE, Total
+  measured, SE1, SE2, LLE/non-LLE primary, and conventional SE/BSE channels.
+
+Canonical NPZ keys are `x_angstrom`, `y_angstrom`, `completed_primaries`,
+`yield__CHANNEL`, `sem__CHANNEL`, and `count__CHANNEL`. The older one-row keys
+remain in the file for compatibility. Full per-primary count vectors are kept
+for one-row scans but deliberately discarded after each 2D pixel to keep image
+memory bounded; the exact total count and Monte-Carlo SEM remain in the NPZ.
+Use `--plot-channels` to select a subset and `--plot-cmap` to change the
+heatmap colormap.
+
+If `--field-height-nm` is omitted for a 2D raster, it defaults to the x field
+width. The present trapezoidal lines are infinite along y, so the expected
+physical contrast is constant along y; independent Monte Carlo noise remains
+visible from row to row. Finite line ends would require a 3D geometry rather
+than only an x-y raster.
 
 ### Animate the complete scan
 

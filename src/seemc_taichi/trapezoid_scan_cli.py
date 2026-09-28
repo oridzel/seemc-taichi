@@ -1,10 +1,10 @@
-"""Animation-ready Taichi scan across one or more trapezoidal lines.
+"""Taichi line scans and x-y rasters across one or more trapezoidal lines.
 
-The command follows the established ``seemc-imaging`` line-scan workflow: a
-strictly one-dimensional scan writes CSV and raster NPZ results plus one
-combined ``.trajectories.npz`` archive.  Trajectory recording is enabled by
-default for a small subset of primaries at every pixel; every simulated
-primary still contributes to the yield profiles.
+The command follows the established ``seemc-imaging`` raster workflow.  A
+one-row scan may also write a combined ``.trajectories.npz`` archive for the
+whole-scan animator.  A two-dimensional raster simulates every x-y pixel
+independently and writes CSV, self-describing NPZ maps, and optional heatmaps;
+trajectory recording is intentionally disabled for this imaging mode.
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ from .trapezoid import (
 from .trapezoid_scan import (
     CHANNELS,
     plot_scan,
-    run_line_scan,
+    plot_raster,
+    run_raster_scan,
     save_scan_csv,
     save_scan_npz,
     save_trajectory_archive_npz,
@@ -56,6 +57,8 @@ def _parser():
     p.add_argument("--top-width-nm", type=float, default=50.0)
     p.add_argument("--bottom-width-nm", type=float, default=70.0)
     p.add_argument("--height-nm", type=float, default=50.0)
+    p.add_argument("--suspended", action="store_true",
+                   help="finite-thickness lines with vacuum below and in the gaps")
     p.add_argument("--n-lines", type=int, default=1)
     p.add_argument(
         "--pitch-nm", type=float, default=100.0,
@@ -69,8 +72,20 @@ def _parser():
             "40 nm of substrate on each side (--scan-width-nm is an alias)"
         ),
     )
+    p.add_argument(
+        "--field-height-nm", type=float, default=None,
+        help=(
+            "total y scan height; for ny>1 the default equals the x field "
+            "width"
+        ),
+    )
 
-    p.add_argument("--pixels", type=int, default=101)
+    p.add_argument("--nx", type=int, default=None, help="number of x pixels")
+    p.add_argument("--ny", type=int, default=1, help="number of y pixels")
+    p.add_argument(
+        "--pixels", type=int, default=None,
+        help="legacy alias for --nx (default 101)",
+    )
     p.add_argument(
         "--trajectories", "--primaries-per-pixel", dest="trajectories",
         type=int, default=100,
@@ -80,6 +95,8 @@ def _parser():
         "--beam-fwhm-nm", type=float, default=0.0,
         help="Gaussian beam FWHM; zero uses a point beam",
     )
+    p.add_argument("--no-per-primary-counts", action="store_true",
+                   help="retain yields, SEMs and total counts, without large per-primary arrays")
     p.add_argument("--seed", type=int, default=20260811)
 
     # Accepted for command compatibility. Taichi parallelizes each pixel on
@@ -133,7 +150,8 @@ def _parser():
         "--output", type=Path, default=None,
         help=(
             "CSV output path; companion .npz and .trajectories.npz paths are "
-            "derived automatically (default line_scan.csv)"
+            "derived automatically (defaults: line_scan.csv for ny=1, "
+            "trapezoid_raster.csv otherwise)"
         ),
     )
     p.add_argument("--raster-output", type=Path)
@@ -143,6 +161,15 @@ def _parser():
         help="legacy alias deriving PREFIX.csv, PREFIX.npz and PREFIX.trajectories.npz",
     )
     p.add_argument("--plot", action="store_true")
+    p.add_argument(
+        "--plot-channels",
+        default=(
+            "cascade_all,primary_all,tey,se1,se2,lle_primary,"
+            "non_lle_primary,sey_50ev,bsey_50ev"
+        ),
+        help="comma-separated channels in the --plot overview",
+    )
+    p.add_argument("--plot-cmap", default="gray", help="matplotlib heatmap colormap")
     return p
 
 
@@ -165,8 +192,17 @@ def _validate_args(p, args):
         p.error("--n-lines must be >=1")
     if args.n_lines > 1 and args.pitch_nm < args.bottom_width_nm:
         p.error("--pitch-nm must be >= --bottom-width-nm to avoid overlap")
-    if args.pixels < 2:
-        p.error("--pixels must be >=2")
+    if args.nx is not None and args.pixels is not None and args.nx != args.pixels:
+        p.error("--nx and legacy --pixels must match when both are supplied")
+    args.nx = args.nx if args.nx is not None else args.pixels
+    args.nx = 101 if args.nx is None else int(args.nx)
+    # Keep the resolved legacy attribute available to downstream compatibility
+    # selectors without making it the canonical name in new metadata.
+    args.pixels = args.nx
+    if args.nx < 2:
+        p.error("--nx must be >=2")
+    if args.ny < 1:
+        p.error("--ny must be >=1")
     if args.trajectories < 1:
         p.error("--trajectories must be positive")
     if not math.isfinite(args.beam_fwhm_nm) or args.beam_fwhm_nm < 0.0:
@@ -195,6 +231,15 @@ def _validate_args(p, args):
         p.error("--workers must be positive")
     if args.output is not None and args.output_prefix is not None:
         p.error("use either --output or --output-prefix, not both")
+    plot_channels = tuple(
+        value.strip() for value in str(args.plot_channels).split(",") if value.strip()
+    )
+    if not plot_channels:
+        p.error("--plot-channels must contain at least one channel")
+    unknown_channels = [value for value in plot_channels if value not in CHANNELS]
+    if unknown_channels:
+        p.error("unknown --plot-channels: " + ", ".join(unknown_channels))
+    args.plot_channels = plot_channels
     return precision
 
 
@@ -209,6 +254,7 @@ def main(argv=None):
         height=10.0 * args.height_nm,
         n_lines=args.n_lines,
         pitch=10.0 * args.pitch_nm,
+        suspended=args.suspended,
     ).validate()
     array_span_nm = geometry.span / 10.0
     field_width_nm = (
@@ -223,9 +269,44 @@ def main(argv=None):
             f"--field-width-nm={field_width_nm:g} does not cover the full "
             f"line-array span of {array_span_nm:g} nm"
         )
-    x_nm = np.linspace(-0.5 * field_width_nm, 0.5 * field_width_nm, args.pixels)
+    requested_field_height_nm = (
+        None if args.field_height_nm is None else float(args.field_height_nm)
+    )
+    if requested_field_height_nm is not None and (
+        not math.isfinite(requested_field_height_nm)
+        or requested_field_height_nm <= 0.0
+    ):
+        p.error("--field-height-nm must be finite and positive")
+    field_height_nm = (
+        0.0
+        if args.ny == 1
+        else (
+            requested_field_height_nm
+            if requested_field_height_nm is not None
+            else field_width_nm
+        )
+    )
+    x_nm = np.linspace(-0.5 * field_width_nm, 0.5 * field_width_nm, args.nx)
+    y_nm = (
+        np.asarray([0.0])
+        if args.ny == 1
+        else np.linspace(-0.5 * field_height_nm, 0.5 * field_height_nm, args.ny)
+    )
 
-    record_trajectories = not args.no_record_trajectories
+    if args.ny > 1 and (
+        args.record_all_trajectories
+        or args.trace_pixel
+        or args.trace_x_nm
+        or args.trace_all_pixels
+        or args.trace_every
+        or args.trace_primaries is not None
+        or args.trajectory_output is not None
+    ):
+        p.error(
+            "trajectory recording and trace selectors require --ny 1; "
+            "use --no-record-trajectories for a 2D image"
+        )
+    record_trajectories = args.ny == 1 and not args.no_record_trajectories
     record_n = (
         args.trajectories
         if args.record_all_trajectories
@@ -240,17 +321,17 @@ def main(argv=None):
     if record_trajectories and sparse_requested:
         trace_pixels = set(int(value) for value in args.trace_pixel)
         if args.trace_every:
-            trace_pixels.update(range(0, args.pixels, args.trace_every))
+            trace_pixels.update(range(0, args.nx, args.trace_every))
         for value in args.trace_x_nm:
             if not math.isfinite(value):
                 p.error("--trace-x-nm values must be finite")
             trace_pixels.add(int(np.argmin(np.abs(x_nm - float(value)))))
     elif record_trajectories:
-        trace_pixels = set(range(args.pixels))
+        trace_pixels = set(range(args.nx))
     else:
         trace_pixels = set()
-    if any(value < 0 or value >= args.pixels for value in trace_pixels):
-        p.error("--trace-pixel values must be in [0, pixels)")
+    if any(value < 0 or value >= args.nx for value in trace_pixels):
+        p.error("--trace-pixel values must be in [0, nx)")
 
     sample, host = load_reference_plane_tables(args.database, args.material)
     bulk = BulkPhysicsConfig.from_sample(sample)
@@ -270,10 +351,13 @@ def main(argv=None):
     )
     ti = init_taichi(backend)
     fp = ti.f32 if precision == "f32" else ti.f64
+    effective_trajectory_capacity = (
+        args.trajectory_capacity if record_trajectories else 1
+    )
     engine = TrapezoidTransportEngine(
         ti, fp, host, bulk, surface, geometry, args.capacity,
         bse_cutoff_ev=cutoff,
-        trajectory_capacity=args.trajectory_capacity,
+        trajectory_capacity=effective_trajectory_capacity,
     )
 
     # Compile once with trajectory recording disabled. The measured scan then
@@ -294,11 +378,17 @@ def main(argv=None):
             "Note: Taichi parallelizes trajectories on the selected device; "
             "scan pixels reuse one engine sequentially."
         )
-    rows, per_primary, trajectories = run_line_scan(
+    if args.ny > 1 and not args.no_record_trajectories:
+        print(
+            "Note: trajectory recording is disabled automatically for a 2D "
+            "raster; all primaries contribute to the image maps."
+        )
+    rows, per_primary, trajectories = run_raster_scan(
         engine,
         geometry,
         energy_ev=args.energy_ev,
         x_positions_angstrom=10.0 * x_nm,
+        y_positions_angstrom=10.0 * y_nm,
         primaries_per_pixel=args.trajectories,
         beam_fwhm_angstrom=10.0 * args.beam_fwhm_nm,
         seed=args.seed,
@@ -310,18 +400,22 @@ def main(argv=None):
         trace_n_primaries=record_n if record_trajectories else 0,
         trajectory_stride=args.trajectory_stride,
         trajectory_max_points=args.trajectory_max_points,
+        store_per_primary_counts=args.ny == 1 and not args.no_per_primary_counts,
     )
 
     if args.output_prefix is not None:
         csv_path = args.output_prefix.parent / f"{args.output_prefix.name}.csv"
     else:
-        csv_path = args.output or Path("line_scan.csv")
+        csv_path = args.output or Path(
+            "line_scan.csv" if args.ny == 1 else "trapezoid_raster.csv"
+        )
     csv_path, default_raster, default_trajectory = _derived_outputs(csv_path)
     raster_path = args.raster_output or default_raster
     trajectory_path = args.trajectory_output or default_trajectory
 
     geometry_metadata = {
         "type": "TrapezoidalLineArray",
+        "suspended": geometry.suspended,
         "top_width": geometry.top_width,
         "bottom_width": geometry.bottom_width,
         "height": geometry.height,
@@ -347,8 +441,12 @@ def main(argv=None):
         "line_centers_nm": [value / 10.0 for value in geometry.line_centers],
         "array_span_nm": array_span_nm,
         "field_width_nm": field_width_nm,
+        "field_height_nm": field_height_nm,
         "scan_width_nm": field_width_nm,
-        "pixels": args.pixels,
+        "nx": args.nx,
+        "ny": args.ny,
+        "n_pixels": args.nx * args.ny,
+        "pixels": args.nx,
         "primaries_per_pixel": args.trajectories,
         "beam_fwhm_nm": args.beam_fwhm_nm,
         "capacity_per_pixel": args.capacity,
@@ -356,21 +454,27 @@ def main(argv=None):
         "bse_cutoff_ev": cutoff,
         "lle_max_loss_ev": args.lle_max_loss_ev,
         "recorded_pixels": sorted(trace_pixels),
+        "record_trajectories": record_trajectories,
+        "stores_per_primary_counts": args.ny == 1 and not args.no_per_primary_counts,
         "record_primaries_per_pixel": record_n if record_trajectories else 0,
         "trajectory_stride": args.trajectory_stride,
         "trajectory_max_points": args.trajectory_max_points,
-        "trajectory_capacity_per_pixel": args.trajectory_capacity,
+        "trajectory_capacity_per_pixel": effective_trajectory_capacity,
         "barrier_model": surface.barrier_model,
         "inner_potential_ev": surface.inner_potential_ev,
+        "suspended": geometry.suspended,
+        "signal_convention": "all-direction legacy channels exclude vacuum misses; use back_* for uz<0",
         "se1_definition": "generation==1 and own_inelastic_count==0",
         "geometry_convention": (
+            "line tops z=-height; bottom z=0; vacuum outside finite lines; lines infinite y"
+            if geometry.suspended else
             "vacuum negative z; line tops z=-height; substrate z=0; lines infinite y"
         ),
         "geometry": geometry_metadata,
         "config": {
             "energy_ev": args.energy_ev,
             "x_positions_angstrom": list(10.0 * x_nm),
-            "y_positions_angstrom": [0.0],
+            "y_positions_angstrom": list(10.0 * y_nm),
             "primaries_per_pixel": args.trajectories,
             "beam_fwhm_angstrom": [
                 10.0 * args.beam_fwhm_nm,
@@ -410,15 +514,29 @@ def main(argv=None):
         f"Geometry: {args.n_lines} line(s), pitch={args.pitch_nm:g} nm, "
         f"centers={centers_nm} nm"
     )
-    print(f"Scan: ny=1, nx={args.pixels}, field width={field_width_nm:g} nm")
+    if args.ny == 1:
+        print(f"Scan: ny=1, nx={args.nx}, field width={field_width_nm:g} nm")
+    else:
+        print(
+            f"Scan: ny={args.ny}, nx={args.nx}, "
+            f"field={field_width_nm:g} x {field_height_nm:g} nm"
+        )
     print(
-        "Physical animation profiles: cascade_all=Full SE, "
-        "primary_all=Full BSE (LLE + non-LLE), tey=Total measured."
+        "Channels: legacy totals include all emission directions; "
+        "back_* means final uz<0, forward_* means uz>=0. "
+        "Vacuum misses are excluded; see gap_primary_fraction."
     )
 
     if args.plot:
         png_path = csv_path.with_suffix(".png")
-        plot_scan(
+        plotter = plot_scan if args.ny == 1 else plot_raster
+        plot_kwargs = {"channels": args.plot_channels}
+        if args.ny > 1:
+            plot_kwargs.update(
+                channels=args.plot_channels,
+                cmap=args.plot_cmap,
+            )
+        plotter(
             png_path,
             rows,
             title=(
@@ -426,6 +544,7 @@ def main(argv=None):
                 f"{args.trajectories:,} primaries/pixel, "
                 f"{args.beam_fwhm_nm:g} nm FWHM"
             ),
+            **plot_kwargs,
         )
         print(f"Wrote {png_path}")
 

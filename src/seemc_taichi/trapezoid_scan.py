@@ -1,8 +1,8 @@
-"""High-statistics Taichi line scans over a raised trapezoidal SEM feature.
+"""High-statistics Taichi rasters over raised trapezoidal SEM lines.
 
 The transport itself is performed by :class:`TrapezoidTransportEngine`.
 This module is deliberately host-side: it turns emitted-electron records into
-per-primary signal counts, Monte-Carlo SEMs, a line-scan CSV, and a compact NPZ.
+per-primary signal counts, Monte-Carlo SEMs, a flat CSV, and a compact 2D NPZ.
 
 Signal taxonomy used here follows the current SEEMC imaging work:
 
@@ -45,6 +45,11 @@ CHANNELS = (
     "non_lle_primary",
 )
 
+# Final far-field direction: -z returns toward the incident-beam side.
+DIRECTIONAL_BASE_CHANNELS = ("tey", "sey_50ev", "bsey_50ev", "primary_all", "se1", "se2")
+CHANNELS += tuple(f"{direction}_{base}" for direction in ("back", "forward")
+                  for base in DIRECTIONAL_BASE_CHANNELS)
+
 CHANNEL_DEFINITIONS = {
     "tey": "All emitted electrons.",
     "sey_50ev": "Emitted electrons with vacuum energy <= the BSE cutoff.",
@@ -62,7 +67,42 @@ CHANNEL_DEFINITIONS = {
     "non_lle_primary": "Emitted original primary with vacuum energy loss >= LLE threshold.",
 }
 
+RASTER_PLOT_CHANNELS = (
+    "cascade_all",
+    "primary_all",
+    "tey",
+    "se1",
+    "se2",
+    "lle_primary",
+    "non_lle_primary",
+    "sey_50ev",
+    "bsey_50ev",
+)
+
+CHANNEL_LABELS = {
+    "tey": "All-direction emitted",
+    "sey_50ev": "SE (E <= cutoff)",
+    "bsey_50ev": "BSE (E > cutoff)",
+    "cascade_all": "Full SE",
+    "primary_all": "Emitted primaries (all directions)",
+    "se1": "SE1",
+    "se2": "SE2",
+    "generation_1": "Generation 1",
+    "generation_2plus": "Generation 2+",
+    "lle_primary": "LLE primary",
+    "non_lle_primary": "Non-LLE primary",
+}
+
+for _direction in ("back", "forward"):
+    for _base in DIRECTIONAL_BASE_CHANNELS:
+        _key = f"{_direction}_{_base}"
+        CHANNEL_LABELS[_key] = f"{_direction}: {CHANNEL_LABELS[_base]}"
+        CHANNEL_DEFINITIONS[_key] = f"{CHANNEL_DEFINITIONS[_base]} Final direction {_direction}."
+
+
 SURFACE_NAMES = {
+    0: "vacuum_gap",
+    5: "bottom",
     1: "top",
     2: "right_sidewall",
     3: "left_sidewall",
@@ -81,6 +121,7 @@ TRAJECTORY_EVENT_NAMES = {
     10: "terminate",
     11: "incoming_barrier_reflection",
     12: "geometry_reentry",
+    13: "vacuum_miss",
 }
 
 _REST_ENERGY_EV = 510_998.95069
@@ -135,6 +176,12 @@ def emission_masks(
         raise RuntimeError("SE1/SE2 masks do not partition cascade emissions")
     if np.any(masks["se1"] & masks["se2"]):
         raise RuntimeError("SE1/SE2 masks overlap")
+    uz = np.asarray(result.get("emission_uz", np.zeros(len(energy))), dtype=float)
+    if uz.shape != energy.shape:
+        raise ValueError("emission_uz shape does not match energy")
+    for direction, selection in (("back", uz < 0.0), ("forward", uz >= 0.0)):
+        for base in DIRECTIONAL_BASE_CHANNELS:
+            masks[f"{direction}_{base}"] = masks[base] & selection
     return masks
 
 
@@ -198,16 +245,19 @@ def _pixel_seed(base_seed: int, pixel_index: int) -> int:
 def nominal_surface_info(geometry, x_angstrom: float) -> tuple[float, str, float]:
     z, _nx, nz, code = geometry.launch_surface(float(x_angstrom))
     cosine = max(-1.0, min(1.0, -float(nz)))
-    incidence = math.degrees(math.acos(cosine))
+    incidence = math.degrees(math.acos(cosine)) if code != 0 else math.nan
+    if code == 0:
+        z = math.nan
     return float(z), SURFACE_NAMES[int(code)], incidence
 
 
-def run_line_scan(
+def run_raster_scan(
     engine,
     geometry,
     *,
     energy_ev: float,
     x_positions_angstrom,
+    y_positions_angstrom,
     primaries_per_pixel: int,
     beam_fwhm_angstrom: float = 0.0,
     seed: int = 20260916,
@@ -219,11 +269,31 @@ def run_line_scan(
     trace_n_primaries: int = 0,
     trajectory_stride: int = 1,
     trajectory_max_points: int | None = None,
+    store_per_primary_counts: bool = False,
 ) -> tuple[list[dict], dict[str, np.ndarray], dict[int, dict]]:
-    """Run a normal-incidence one-dimensional trapezoidal line scan."""
+    """Run independent normal-incidence ensembles on an x-y raster.
+
+    Pixel identifiers are row-major: ``pixel_id = iy * nx + ix``.  When
+    ``store_per_primary_counts`` is true, returned count arrays have shape
+    ``(ny, nx, primaries_per_pixel)``; otherwise only exact per-pixel totals,
+    yields, and SEMs are retained in ``rows``. The current geometry is
+    translationally invariant along y, but every y row is simulated
+    independently so the output is a genuine Monte-Carlo raster.
+    """
     x_positions = np.asarray(x_positions_angstrom, dtype=float)
-    if x_positions.ndim != 1 or x_positions.size < 1 or not np.all(np.isfinite(x_positions)):
+    y_positions = np.asarray(y_positions_angstrom, dtype=float)
+    if (
+        x_positions.ndim != 1
+        or x_positions.size < 1
+        or not np.all(np.isfinite(x_positions))
+    ):
         raise ValueError("x_positions_angstrom must be a finite one-dimensional array")
+    if (
+        y_positions.ndim != 1
+        or y_positions.size < 1
+        or not np.all(np.isfinite(y_positions))
+    ):
+        raise ValueError("y_positions_angstrom must be a finite one-dimensional array")
     n = int(primaries_per_pixel)
     if n < 1:
         raise ValueError("primaries_per_pixel must be positive")
@@ -238,16 +308,25 @@ def run_line_scan(
     trajectory_pixels = set() if trajectory_pixels is None else set(int(v) for v in trajectory_pixels)
     trajectories: dict[int, dict] = {}
     total_start = time.perf_counter()
+    nx = len(x_positions)
+    ny = len(y_positions)
+    n_pixels = nx * ny
+    progress_stride = 1 if ny == 1 else max(1, n_pixels // 100)
+    if any(pixel < 0 or pixel >= n_pixels for pixel in trajectory_pixels):
+        raise ValueError("trajectory pixel IDs are outside the raster")
 
-    for ix, x in enumerate(x_positions):
-        pseed = _pixel_seed(seed, ix)
+    for pixel_id in range(n_pixels):
+        iy, ix = divmod(pixel_id, nx)
+        x = x_positions[ix]
+        y = y_positions[iy]
+        pseed = _pixel_seed(seed, pixel_id)
         start = time.perf_counter()
-        trace_this_pixel = ix in trajectory_pixels and int(trace_n_primaries) > 0
+        trace_this_pixel = pixel_id in trajectory_pixels and int(trace_n_primaries) > 0
         result = engine.run_trapezoid(
             n=n,
             energy_vac_ev=float(energy_ev),
             nominal_x=float(x),
-            nominal_y=0.0,
+            nominal_y=float(y),
             beam_fwhm=float(beam_fwhm_angstrom),
             seed=pseed,
             steps_per_chunk=int(steps_per_chunk),
@@ -268,11 +347,15 @@ def run_line_scan(
         collision_events = int(diag["elastic_events"]) + int(diag["inelastic_events"])
 
         row = {
-            "pixel_id": ix,
+            "pixel_id": pixel_id,
+            "iy": iy,
+            "ix": ix,
             "x_nm": float(x) / 10.0,
+            "y_nm": float(y) / 10.0,
             "nominal_surface_z_nm": z_nom / 10.0,
             "nominal_surface_id": surface_name,
             "nominal_local_incidence_deg": incidence_nom,
+            "gap_primary_fraction": float(result.get("gap_primary_fraction", 0.0)),
             "launch_mean_x_nm": float(result.get("launch_mean_x_angstrom", x)) / 10.0,
             "launch_mean_y_nm": float(result.get("launch_mean_y_angstrom", 0.0)) / 10.0,
             "launch_surface_z_mean_nm": float(result.get("launch_surface_z_mean_angstrom", z_nom)) / 10.0,
@@ -294,42 +377,95 @@ def run_line_scan(
         for channel in CHANNELS:
             value = float(classified[channel])
             sem = float(classified[f"{channel}_sem"])
+            counts = np.asarray(
+                classified[f"{channel}_counts_per_primary"], dtype=np.int32
+            )
             row[channel] = value if valid else math.nan
             row[f"{channel}_sem"] = sem if valid else math.nan
             row[f"raw_{channel}"] = value
-            per_primary[channel].append(
-                np.asarray(classified[f"{channel}_counts_per_primary"], dtype=np.int32)
-            )
+            row[f"yield__{channel}"] = row[channel]
+            row[f"sem__{channel}"] = row[f"{channel}_sem"]
+            row[f"count__{channel}"] = int(counts.sum(dtype=np.int64))
+            if store_per_primary_counts:
+                per_primary[channel].append(counts)
         for name, value in diag.items():
             key = f"diag_{name}" if name in row else name
             row[key] = int(value)
         if trace_this_pixel:
-            trajectories[ix] = extract_trajectory_payload(
+            trajectories[pixel_id] = extract_trajectory_payload(
                 result,
-                pixel_id=ix,
+                pixel_id=pixel_id,
                 x_nm=row["x_nm"],
+                y_nm=row["y_nm"],
                 stride=trajectory_stride,
                 max_points=trajectory_max_points,
             )
         rows.append(row)
 
-        if progress:
+        if progress and (
+            pixel_id % progress_stride == 0 or pixel_id == n_pixels - 1
+        ):
             tag = "VALID" if valid else f"INVALID:{status}"
             print(
-                f"[{ix + 1}/{len(x_positions)}] x={x / 10.0:+.3f} nm "
+                f"[{pixel_id + 1}/{n_pixels}] x={x / 10.0:+.3f} nm "
+                f"y={y / 10.0:+.3f} nm "
                 f"{surface_name} {tag}  TEY={float(classified['tey']):.4f} "
                 f"SE1={float(classified['se1']):.4f} "
                 f"SE2={float(classified['se2']):.4f} "
                 f"BSE={float(classified['primary_all']):.4f}  {elapsed:.3f}s"
             )
 
-    per_primary_arrays = {
-        channel: np.stack(values, axis=0) if values else np.empty((0, n), dtype=np.int32)
-        for channel, values in per_primary.items()
-    }
+    per_primary_arrays = {}
+    for channel, values in per_primary.items():
+        per_primary_arrays[channel] = (
+            np.stack(values, axis=0).reshape(ny, nx, n)
+            if values
+            else np.empty(0, dtype=np.int32)
+        )
     if progress:
-        print(f"line scan complete in {time.perf_counter() - total_start:.3f} s")
+        print(f"raster scan complete in {time.perf_counter() - total_start:.3f} s")
     return rows, per_primary_arrays, trajectories
+
+
+def run_line_scan(
+    engine,
+    geometry,
+    *,
+    energy_ev: float,
+    x_positions_angstrom,
+    primaries_per_pixel: int,
+    beam_fwhm_angstrom: float = 0.0,
+    seed: int = 20260916,
+    steps_per_chunk: int = 256,
+    cutoff_ev: float = 50.0,
+    lle_max_loss_ev: float = 50.0,
+    progress: bool = True,
+    trajectory_pixels: set[int] | None = None,
+    trace_n_primaries: int = 0,
+    trajectory_stride: int = 1,
+    trajectory_max_points: int | None = None,
+) -> tuple[list[dict], dict[str, np.ndarray], dict[int, dict]]:
+    """Backward-compatible one-row wrapper around :func:`run_raster_scan`."""
+    rows, per_primary, trajectories = run_raster_scan(
+        engine,
+        geometry,
+        energy_ev=energy_ev,
+        x_positions_angstrom=x_positions_angstrom,
+        y_positions_angstrom=np.asarray([0.0]),
+        primaries_per_pixel=primaries_per_pixel,
+        beam_fwhm_angstrom=beam_fwhm_angstrom,
+        seed=seed,
+        steps_per_chunk=steps_per_chunk,
+        cutoff_ev=cutoff_ev,
+        lle_max_loss_ev=lle_max_loss_ev,
+        progress=progress,
+        trajectory_pixels=trajectory_pixels,
+        trace_n_primaries=trace_n_primaries,
+        trajectory_stride=trajectory_stride,
+        trajectory_max_points=trajectory_max_points,
+        store_per_primary_counts=True,
+    )
+    return rows, {name: values[0] for name, values in per_primary.items()}, trajectories
 
 
 def _flight_time_fs(distance_angstrom: float, energy_ev: float) -> float:
@@ -415,6 +551,7 @@ def extract_trajectory_payload(
     *,
     pixel_id: int,
     x_nm: float,
+    y_nm: float = 0.0,
     stride: int = 1,
     max_points: int | None = None,
 ) -> dict:
@@ -431,6 +568,7 @@ def extract_trajectory_payload(
     payload = {
         "pixel_id": int(pixel_id),
         "x_nm": float(x_nm),
+        "y_nm": float(y_nm),
         "trace_n_primaries": trace_n,
         "trajectory_overflow": bool(result.get("trajectory_overflow", False)),
         "trajectory_event_names_json": json.dumps(TRAJECTORY_EVENT_NAMES, sort_keys=True),
@@ -486,13 +624,57 @@ def save_scan_csv(path: str | Path, rows: list[dict]) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        raise ValueError("cannot save an empty line scan")
+        raise ValueError("cannot save an empty raster scan")
     fields = list(rows[0])
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     return path
+
+
+def _raster_layout(rows: list[dict]):
+    """Return ordered axes and a ``(ny, nx)`` object array of pixel rows."""
+    if not rows:
+        raise ValueError("cannot lay out an empty raster")
+    indexed = all("ix" in row and "iy" in row for row in rows)
+    if indexed:
+        nx = max(int(row["ix"]) for row in rows) + 1
+        ny = max(int(row["iy"]) for row in rows) + 1
+    else:
+        nx = len(rows)
+        ny = 1
+    if nx < 1 or ny < 1 or len(rows) != nx * ny:
+        raise ValueError("rows do not form a complete rectangular raster")
+
+    grid = np.empty((ny, nx), dtype=object)
+    grid.fill(None)
+    x_nm = np.full(nx, np.nan, dtype=float)
+    y_nm = np.full(ny, np.nan, dtype=float)
+    for fallback, row in enumerate(rows):
+        iy = int(row.get("iy", 0))
+        ix = int(row.get("ix", fallback))
+        if not (0 <= iy < ny and 0 <= ix < nx) or grid[iy, ix] is not None:
+            raise ValueError("raster rows contain invalid or duplicate pixel indices")
+        x_value = float(row["x_nm"])
+        y_value = float(row.get("y_nm", 0.0))
+        if np.isfinite(x_nm[ix]) and not math.isclose(x_nm[ix], x_value):
+            raise ValueError("x coordinate is inconsistent within a raster column")
+        if np.isfinite(y_nm[iy]) and not math.isclose(y_nm[iy], y_value):
+            raise ValueError("y coordinate is inconsistent within a raster row")
+        x_nm[ix] = x_value
+        y_nm[iy] = y_value
+        grid[iy, ix] = row
+    if any(value is None for value in grid.flat):
+        raise ValueError("raster rows leave one or more pixels missing")
+    return x_nm, y_nm, grid
+
+
+def _row_map(grid: np.ndarray, key: str, *, dtype=float) -> np.ndarray:
+    return np.asarray(
+        [[grid[iy, ix][key] for ix in range(grid.shape[1])] for iy in range(grid.shape[0])],
+        dtype=dtype,
+    )
 
 
 def save_scan_npz(
@@ -505,26 +687,85 @@ def save_scan_npz(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        raise ValueError("cannot save an empty line scan")
+        raise ValueError("cannot save an empty raster scan")
+    x_nm, y_nm, grid = _raster_layout(rows)
+    ny, nx = grid.shape
+    metadata_out = dict(metadata)
+    metadata_out.setdefault("format", "seemc-taichi-raster-v1")
+    metadata_out.setdefault("length_unit", "angstrom")
+    metadata_out.setdefault("channel_definitions", CHANNEL_DEFINITIONS)
     payload: dict[str, np.ndarray] = {
-        "x_nm": np.asarray([row["x_nm"] for row in rows], dtype=float),
-        "valid": np.asarray([row["valid"] for row in rows], dtype=bool),
-        "nominal_surface_z_nm": np.asarray([row["nominal_surface_z_nm"] for row in rows], dtype=float),
-        "nominal_local_incidence_deg": np.asarray([row["nominal_local_incidence_deg"] for row in rows], dtype=float),
-        "local_incidence_mean_deg": np.asarray([row["local_incidence_mean_deg"] for row in rows], dtype=float),
-        "local_incidence_sem_deg": np.asarray([row["local_incidence_sem_deg"] for row in rows], dtype=float),
-        "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+        "x_angstrom": 10.0 * x_nm,
+        "y_angstrom": 10.0 * y_nm,
+        "x_nm": x_nm,
+        "y_nm": y_nm,
+        "completed_primaries": _row_map(grid, "n_primaries", dtype=np.int64),
+        "valid_map": _row_map(grid, "valid", dtype=bool),
+        "nominal_surface_z_nm_map": _row_map(grid, "nominal_surface_z_nm"),
+        "nominal_local_incidence_deg_map": _row_map(
+            grid, "nominal_local_incidence_deg"
+        ),
+        "gap_primary_fraction": _row_map(grid, "gap_primary_fraction"),
+        "launch_mean_x_nm": _row_map(grid, "launch_mean_x_nm"),
+        "launch_mean_y_nm": _row_map(grid, "launch_mean_y_nm"),
+        "launch_surface_z_mean_nm": _row_map(
+            grid, "launch_surface_z_mean_nm"
+        ),
+        "local_incidence_mean_deg_map": _row_map(
+            grid, "local_incidence_mean_deg"
+        ),
+        "local_incidence_sem_deg_map": _row_map(
+            grid, "local_incidence_sem_deg"
+        ),
+        "metadata_json": np.asarray(json.dumps(metadata_out, sort_keys=True)),
         "channel_definitions_json": np.asarray(json.dumps(CHANNEL_DEFINITIONS, sort_keys=True)),
     }
+    # Preserve the v0.8 one-row keys while exposing canonical 2D map keys.
+    payload["valid"] = payload["valid_map"][0] if ny == 1 else payload["valid_map"]
+    for source, legacy in (
+        ("nominal_surface_z_nm_map", "nominal_surface_z_nm"),
+        ("nominal_local_incidence_deg_map", "nominal_local_incidence_deg"),
+        ("local_incidence_mean_deg_map", "local_incidence_mean_deg"),
+        ("local_incidence_sem_deg_map", "local_incidence_sem_deg"),
+    ):
+        payload[legacy] = payload[source][0] if ny == 1 else payload[source]
+
     for channel in CHANNELS:
-        payload[channel] = np.asarray([row[channel] for row in rows], dtype=float)
-        payload[f"{channel}_sem"] = np.asarray([row[f"{channel}_sem"] for row in rows], dtype=float)
-        payload[f"{channel}_counts_per_primary"] = np.asarray(per_primary[channel], dtype=np.int32)
+        yield_map = _row_map(grid, channel)
+        sem_map = _row_map(grid, f"{channel}_sem")
+        counts = np.asarray(per_primary.get(channel, ()), dtype=np.int32)
+        if counts.size:
+            if counts.ndim == 2 and ny == 1 and counts.shape[0] == nx:
+                counts = counts[None, :, :]
+            elif counts.ndim == 2 and counts.shape[0] == nx * ny:
+                counts = counts.reshape(ny, nx, counts.shape[1])
+            if counts.ndim != 3 or counts.shape[:2] != (ny, nx):
+                raise ValueError(
+                    f"per-primary array for {channel!r} has shape {counts.shape}; "
+                    f"expected ({ny}, {nx}, n_primaries)"
+                )
+        if all(f"count__{channel}" in row for row in rows):
+            count_map = _row_map(grid, f"count__{channel}", dtype=np.int64)
+        elif counts.size:
+            count_map = counts.sum(axis=-1, dtype=np.int64)
+        else:
+            raise ValueError(
+                f"no total or per-primary counts are available for {channel!r}"
+            )
+        payload[f"yield__{channel}"] = yield_map
+        payload[f"sem__{channel}"] = sem_map
+        payload[f"count__{channel}"] = count_map
+        payload[channel] = yield_map[0] if ny == 1 else yield_map
+        payload[f"{channel}_sem"] = sem_map[0] if ny == 1 else sem_map
+        if counts.size:
+            payload[f"{channel}_counts_per_primary"] = (
+                counts[0] if ny == 1 else counts
+            )
     np.savez_compressed(path, **payload)
     return path
 
 
-def plot_scan(path: str | Path, rows: list[dict], *, title: str | None = None) -> Path:
+def plot_scan(path: str | Path, rows: list[dict], *, title: str | None = None, channels=None) -> Path:
     """Quick diagnostic plot; matplotlib is optional."""
     try:
         import matplotlib.pyplot as plt
@@ -534,13 +775,10 @@ def plot_scan(path: str | Path, rows: list[dict], *, title: str | None = None) -
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(9.0, 5.4))
-    for channel, label in (
-        ("tey", "TEY"),
-        ("cascade_all", "Cascade all"),
-        ("primary_all", "Primary all"),
-        ("se1", "SE1"),
-        ("se2", "SE2"),
-    ):
+    if channels is None:
+        channels = ("tey", "cascade_all", "primary_all", "se1", "se2")
+    for channel in channels:
+        label = CHANNEL_LABELS.get(channel, channel)
         y = np.asarray([row[channel] for row in rows], dtype=float)
         sem = np.asarray([row[f"{channel}_sem"] for row in rows], dtype=float)
         ax.plot(x, y, label=label)
@@ -552,5 +790,67 @@ def plot_scan(path: str | Path, rows: list[dict], *, title: str | None = None) -
     ax.legend(ncol=2)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def plot_raster(
+    path: str | Path,
+    rows: list[dict],
+    *,
+    channels=RASTER_PLOT_CHANNELS,
+    title: str | None = None,
+    cmap: str = "gray",
+) -> Path:
+    """Plot selected yield maps from a two-dimensional scan."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - optional convenience
+        raise RuntimeError("--plot requires matplotlib") from exc
+    x_nm, y_nm, grid = _raster_layout(rows)
+    if len(y_nm) < 2:
+        return plot_scan(path, rows, title=title)
+    channels = tuple(str(channel) for channel in channels)
+    unknown = [channel for channel in channels if channel not in CHANNELS]
+    if unknown:
+        raise KeyError(f"unknown raster channels: {unknown}")
+    if not channels:
+        raise ValueError("at least one raster plot channel is required")
+
+    ncols = min(3, len(channels))
+    nrows = int(math.ceil(len(channels) / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4.6 * ncols, 3.8 * nrows),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    extent = (x_nm[0], x_nm[-1], y_nm[0], y_nm[-1])
+    for axis, channel in zip(axes.flat, channels):
+        values = _row_map(grid, channel)
+        image = axis.imshow(
+            values,
+            origin="lower",
+            aspect="auto",
+            extent=extent,
+            cmap=cmap,
+            interpolation="nearest",
+        )
+        axis.set_title(CHANNEL_LABELS.get(channel, channel))
+        axis.set_xlabel("Beam x (nm)")
+        axis.set_ylabel("Beam y (nm)")
+        fig.colorbar(image, ax=axis, label="electrons / primary")
+    for axis in axes.flat[len(channels):]:
+        axis.set_visible(False)
+    if title:
+        fig.suptitle(title)
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    else:
+        fig.tight_layout()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return path

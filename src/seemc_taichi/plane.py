@@ -52,6 +52,11 @@ class EmissionBuffer:
         self.n_emitted = ti.field(dtype=ti.i32, shape=())
         self.overflow = ti.field(dtype=ti.i32, shape=())
         self.energy = ti.field(dtype=fp, shape=self.capacity)
+        # Final surface-crossing position.  Plane coordinates are Angstrom and
+        # the z coordinate is nominally zero (small round-off is preserved).
+        self.x = ti.field(dtype=fp, shape=self.capacity)
+        self.y = ti.field(dtype=fp, shape=self.capacity)
+        self.z = ti.field(dtype=fp, shape=self.capacity)
         self.ux = ti.field(dtype=fp, shape=self.capacity)
         self.uy = ti.field(dtype=fp, shape=self.capacity)
         self.uz = ti.field(dtype=fp, shape=self.capacity)
@@ -62,9 +67,39 @@ class EmissionBuffer:
         self.is_cascade = ti.field(dtype=ti.i32, shape=self.capacity)
         # 1 = ordinary transport escape; 2 = incoming-barrier reflection.
         self.mechanism = ti.field(dtype=ti.i32, shape=self.capacity)
+        # Collision bookkeeping is deliberately copied into the emission
+        # record so a saved run can be reclassified without rerunning Taichi.
+        self.own_elastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.own_inelastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.path_elastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.path_inelastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.birth_x = ti.field(dtype=fp, shape=self.capacity)
+        self.birth_y = ti.field(dtype=fp, shape=self.capacity)
+        self.birth_z = ti.field(dtype=fp, shape=self.capacity)
 
 
-def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, samples, emissions, active_counter, bse_cutoff_ev):
+class PlaneHistory:
+    """Per-particle collision history used only by planar diagnostic runs.
+
+    ``own_*`` counts collisions experienced by the current electron.  The
+    ``path_*`` counters include the causal ancestry from the root primary to
+    the current electron.  At an inelastic event, the parent counter is
+    incremented before a secondary inherits it, so a generation-1 child born
+    from an otherwise unscattered primary starts with path counts (0, 1).
+    """
+
+    def __init__(self, ti, capacity, fp):
+        self.capacity = int(capacity)
+        self.own_elastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.own_inelastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.path_elastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.path_inelastic_count = ti.field(dtype=ti.i32, shape=self.capacity)
+        self.birth_x = ti.field(dtype=fp, shape=self.capacity)
+        self.birth_y = ti.field(dtype=fp, shape=self.capacity)
+        self.birth_z = ti.field(dtype=fp, shape=self.capacity)
+
+
+def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, samples, emissions, history, active_counter, bse_cutoff_ev):
     physics.validate()
     surface_model = surface.validate()
     if abs(float(surface.inner_potential_ev) - float(tables.inner_potential_ev)) > 1.0e-9:
@@ -598,6 +633,9 @@ def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, sample
         slot = ti.cast(ti.atomic_add(emissions.n_emitted[None], ti.i32(1)), ti.i32)
         if slot < ti.i32(emissions.capacity):
             emissions.energy[slot] = energy_vac
+            emissions.x[slot] = pool.x[i]
+            emissions.y[slot] = pool.y[i]
+            emissions.z[slot] = pool.z[i]
             emissions.ux[slot] = ux
             emissions.uy[slot] = uy
             emissions.uz[slot] = uz
@@ -613,6 +651,13 @@ def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, sample
                 ti.atomic_add(counters.primary_emissions[None], ti.i32(1))
             emissions.is_cascade[slot] = cascade
             emissions.mechanism[slot] = mechanism
+            emissions.own_elastic_count[slot] = history.own_elastic_count[i]
+            emissions.own_inelastic_count[slot] = history.own_inelastic_count[i]
+            emissions.path_elastic_count[slot] = history.path_elastic_count[i]
+            emissions.path_inelastic_count[slot] = history.path_inelastic_count[i]
+            emissions.birth_x[slot] = history.birth_x[i]
+            emissions.birth_y[slot] = history.birth_y[i]
+            emissions.birth_z[slot] = history.birth_z[i]
             if energy_vac <= fp(bse_cutoff):
                 ti.atomic_add(counters.sey_50ev[None], ti.i32(1))
             else:
@@ -639,6 +684,8 @@ def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, sample
             else:
                 ok_event = ti.i32(1)
                 ti.atomic_add(counters.inelastic_events[None], ti.i32(1))
+                history.own_inelastic_count[i] += ti.i32(1)
+                history.path_inelastic_count[i] += ti.i32(1)
 
                 sampled_ch = ch
                 mechanism = ch  # se->binary (1), pl->plasmon (2)
@@ -711,6 +758,13 @@ def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, sample
                                 pool.generation[slot] = child_generation
                                 pool.alive[slot] = ti.i32(1)
                                 pool.steps[slot] = ti.i32(0)
+                                history.own_elastic_count[slot] = ti.i32(0)
+                                history.own_inelastic_count[slot] = ti.i32(0)
+                                history.path_elastic_count[slot] = history.path_elastic_count[i]
+                                history.path_inelastic_count[slot] = history.path_inelastic_count[i]
+                                history.birth_x[slot] = pool.x[i]
+                                history.birth_y[slot] = pool.y[i]
+                                history.birth_z[slot] = pool.z[i]
                                 ti.atomic_add(counters.secondaries_queued[None], ti.i32(1))
                             else:
                                 pool.overflow[None] = ti.i32(1)
@@ -764,6 +818,13 @@ def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, sample
             pool.root_primary_id[i] = i
             pool.generation[i] = ti.i32(0)
             pool.steps[i] = ti.i32(0)
+            history.own_elastic_count[i] = ti.i32(0)
+            history.own_inelastic_count[i] = ti.i32(0)
+            history.path_elastic_count[i] = ti.i32(0)
+            history.path_inelastic_count[i] = ti.i32(0)
+            history.birth_x[i] = fp(0.0)
+            history.birth_y[i] = fp(0.0)
+            history.birth_z[i] = fp(0.0)
             samples.valid[i] = ti.i32(0)
             samples.sampled_channel[i] = ti.i32(0)
             samples.mechanism[i] = ti.i32(0)
@@ -903,6 +964,8 @@ def build_plane_kernels(ti, pool, tables, fp, physics, surface, counters, sample
                                     pool.ux[i] = ux
                                     pool.uy[i] = uy
                                     pool.uz[i] = uz
+                                    history.own_elastic_count[i] += ti.i32(1)
+                                    history.path_elastic_count[i] += ti.i32(1)
                                     ti.atomic_add(counters.elastic_events[None], ti.i32(1))
                                 else:
                                     do_inelastic(i, ti.i32(1))
@@ -939,6 +1002,7 @@ class PlaneTransportEngine:
         self.counters = PlaneCounters(ti)
         self.samples = InelasticSamples(ti, self.capacity, fp)
         self.emissions = EmissionBuffer(ti, self.capacity, fp)
+        self.history = PlaneHistory(ti, self.capacity, fp)
         self.active_counter = ti.field(dtype=ti.i32, shape=())
         (
             self.seed_kernel,
@@ -946,7 +1010,7 @@ class PlaneTransportEngine:
             self.process_wave_kernel,
         ) = build_plane_kernels(
             ti, self.pool, self.tables, fp, physics, surface,
-            self.counters, self.samples, self.emissions, self.active_counter,
+            self.counters, self.samples, self.emissions, self.history, self.active_counter,
             self.bse_cutoff_ev,
         )
 
@@ -971,6 +1035,9 @@ class PlaneTransportEngine:
             "n_emitted_stored": n_emit,
             "emission_overflow": bool(e.overflow[None]),
             "emission_energy_ev": e.energy.to_numpy()[:n_emit],
+            "emission_x_angstrom": e.x.to_numpy()[:n_emit],
+            "emission_y_angstrom": e.y.to_numpy()[:n_emit],
+            "emission_z_angstrom": e.z.to_numpy()[:n_emit],
             "emission_ux": e.ux.to_numpy()[:n_emit],
             "emission_uy": e.uy.to_numpy()[:n_emit],
             "emission_uz": e.uz.to_numpy()[:n_emit],
@@ -980,6 +1047,13 @@ class PlaneTransportEngine:
             "emission_generation": e.generation.to_numpy()[:n_emit],
             "emission_is_cascade": e.is_cascade.to_numpy()[:n_emit],
             "emission_mechanism": e.mechanism.to_numpy()[:n_emit],
+            "emission_own_elastic_count": e.own_elastic_count.to_numpy()[:n_emit],
+            "emission_own_inelastic_count": e.own_inelastic_count.to_numpy()[:n_emit],
+            "emission_path_elastic_count": e.path_elastic_count.to_numpy()[:n_emit],
+            "emission_path_inelastic_count": e.path_inelastic_count.to_numpy()[:n_emit],
+            "emission_birth_x_angstrom": e.birth_x.to_numpy()[:n_emit],
+            "emission_birth_y_angstrom": e.birth_y.to_numpy()[:n_emit],
+            "emission_birth_z_angstrom": e.birth_z.to_numpy()[:n_emit],
         }
 
     def run_plane(
@@ -1059,6 +1133,7 @@ class PlaneTransportEngine:
             result.update(self._copy_emissions())
         if copy_state:
             p = self.pool
+            h = self.history
             result.update({
                 "x": p.x.to_numpy()[:stored], "y": p.y.to_numpy()[:stored],
                 "z": p.z.to_numpy()[:stored], "ux": p.ux.to_numpy()[:stored],
@@ -1069,6 +1144,13 @@ class PlaneTransportEngine:
                 "root_primary_id": p.root_primary_id.to_numpy()[:stored],
                 "generation": p.generation.to_numpy()[:stored],
                 "steps": p.steps.to_numpy()[:stored],
+                "own_elastic_count": h.own_elastic_count.to_numpy()[:stored],
+                "own_inelastic_count": h.own_inelastic_count.to_numpy()[:stored],
+                "path_elastic_count": h.path_elastic_count.to_numpy()[:stored],
+                "path_inelastic_count": h.path_inelastic_count.to_numpy()[:stored],
+                "birth_x_angstrom": h.birth_x.to_numpy()[:stored],
+                "birth_y_angstrom": h.birth_y.to_numpy()[:stored],
+                "birth_z_angstrom": h.birth_z.to_numpy()[:stored],
             })
         return result
 

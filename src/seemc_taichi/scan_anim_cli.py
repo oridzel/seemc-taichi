@@ -198,6 +198,7 @@ def _geometry_values(archive, args):
         "height": height,
         "centers": np.asarray(centers, dtype=float),
         "substrate_height": substrate_height,
+        "suspended": bool(geometry.get("suspended", metadata.get("suspended", False))),
     }
 
 
@@ -439,7 +440,8 @@ def animate_trapezoidal_scan(
         edgecolor="none",
         zorder=0,
     )
-    axis.add_patch(support)
+    if not geometry.get("suspended", False):
+        axis.add_patch(support)
     half_top = 0.5 * geometry["top_width"]
     for center in geometry["centers"]:
         vertices = [
@@ -452,6 +454,8 @@ def animate_trapezoidal_scan(
             vertices, closed=True, facecolor=solid_color,
             edgecolor="none", zorder=1,
         ))
+        if geometry.get("suspended", False):
+            vertices.append(vertices[0])
         # Draw only exposed top/side surfaces.  Omitting the base edge keeps
         # each line visually continuous with the same-colour substrate.
         axis.plot(
@@ -459,23 +463,24 @@ def animate_trapezoidal_scan(
             [value[1] for value in vertices],
             color=surface_color, linewidth=1.1, zorder=2,
         )
-    exposed = sorted(
-        (float(center - half_bottom), float(center + half_bottom))
-        for center in geometry["centers"]
-    )
-    cursor = axis.get_xlim()[0]
-    for left, right in exposed:
-        if left > cursor:
+    if not geometry.get("suspended", False):
+        exposed = sorted(
+            (float(center - half_bottom), float(center + half_bottom))
+            for center in geometry["centers"]
+        )
+        cursor = axis.get_xlim()[0]
+        for left, right in exposed:
+            if left > cursor:
+                axis.plot(
+                    [cursor, left], [substrate_height, substrate_height],
+                    color=surface_color, linewidth=1.0, zorder=2,
+                )
+            cursor = max(cursor, right)
+        if cursor < axis.get_xlim()[1]:
             axis.plot(
-                [cursor, left], [substrate_height, substrate_height],
+                [cursor, axis.get_xlim()[1]], [substrate_height, substrate_height],
                 color=surface_color, linewidth=1.0, zorder=2,
             )
-        cursor = max(cursor, right)
-    if cursor < axis.get_xlim()[1]:
-        axis.plot(
-            [cursor, axis.get_xlim()[1]], [substrate_height, substrate_height],
-            color=surface_color, linewidth=1.0, zorder=2,
-        )
 
     beam_line, = axis.plot([], [], color="#59e1ff", linewidth=2.1,
                            alpha=0.9, zorder=4)

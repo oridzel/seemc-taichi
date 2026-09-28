@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seemc-taichi"
-version = "0.8.0"
+version = "0.9.2"
 description = "Experimental Taichi acceleration backend for SEEMC electron Monte Carlo transport"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 reference = ["seemc-imaging>=0.7.5"]
 test = ["pytest>=8"]
+psf = ["matplotlib>=3.8"]
 animation = ["matplotlib>=3.8", "pillow>=10"]
 
 [project.scripts]
@@ -26,6 +27,7 @@ seemc-taichi-trapezoid = "seemc_taichi.trapezoid_scan_cli:main"
 seemc-taichi-animate-trapezoid = "seemc_taichi.scan_anim_cli:main"
 seemc-taichi-animate-scan = "seemc_taichi.scan_anim_cli:main"
 seemc-taichi-animate-pixel = "seemc_taichi.trajectory_anim_cli:main"
+seemc-taichi-plane-psf = "seemc_taichi.plane_psf_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

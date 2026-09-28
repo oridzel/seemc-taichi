@@ -81,6 +81,9 @@ def _save_emissions(path: Path, result: dict, row: dict) -> None:
         bse_cutoff_eV=np.asarray(float(row["bse_cutoff_eV"])),
         valid=np.asarray(bool(row["valid"])),
         emission_energy_ev=result["emission_energy_ev"],
+        emission_x_angstrom=result["emission_x_angstrom"],
+        emission_y_angstrom=result["emission_y_angstrom"],
+        emission_z_angstrom=result["emission_z_angstrom"],
         emission_ux=result["emission_ux"],
         emission_uy=result["emission_uy"],
         emission_uz=result["emission_uz"],
@@ -90,6 +93,13 @@ def _save_emissions(path: Path, result: dict, row: dict) -> None:
         emission_generation=result["emission_generation"],
         emission_is_cascade=result["emission_is_cascade"],
         emission_mechanism=result["emission_mechanism"],
+        emission_own_elastic_count=result["emission_own_elastic_count"],
+        emission_own_inelastic_count=result["emission_own_inelastic_count"],
+        emission_path_elastic_count=result["emission_path_elastic_count"],
+        emission_path_inelastic_count=result["emission_path_inelastic_count"],
+        emission_birth_x_angstrom=result["emission_birth_x_angstrom"],
+        emission_birth_y_angstrom=result["emission_birth_y_angstrom"],
+        emission_birth_z_angstrom=result["emission_birth_z_angstrom"],
     )
 
 
