@@ -199,6 +199,8 @@ def _geometry_values(archive, args):
         "centers": np.asarray(centers, dtype=float),
         "substrate_height": substrate_height,
         "suspended": bool(geometry.get("suspended", metadata.get("suspended", False))),
+        "membrane_thickness": (None if geometry.get("membrane_thickness") is None
+                               else float(geometry["membrane_thickness"]) / 10.0),
     }
 
 
@@ -425,6 +427,9 @@ def animate_trapezoidal_scan(
     x_margin = max(0.08 * (content_right - content_left), 8.0)
     axis.set_xlim(content_left - x_margin, content_right + x_margin)
     lower_limit = substrate_height - max(0.35 * height, 12.0)
+    membrane = geometry.get("membrane_thickness")
+    if membrane is not None:
+        lower_limit = substrate_height - membrane - 12.0
     axis.set_ylim(lower_limit, substrate_height + height + vacuum_flight_nm)
     axis.set_ylabel("Height above line base (nm)", color="#e5e7eb")
     axis.tick_params(labelbottom=False)
@@ -432,16 +437,19 @@ def animate_trapezoidal_scan(
 
     solid_color = "#2d4057"
     surface_color = "#9fb3c8"
+    support_bottom = lower_limit if membrane is None else substrate_height - membrane
     support = Rectangle(
-        (content_left - 2.0 * x_margin, lower_limit),
+        (content_left - 2.0 * x_margin, support_bottom),
         content_right - content_left + 4.0 * x_margin,
-        substrate_height - lower_limit,
+        substrate_height - support_bottom,
         facecolor=solid_color,
         edgecolor="none",
         zorder=0,
     )
     if not geometry.get("suspended", False):
         axis.add_patch(support)
+        if membrane is not None:
+            axis.axhline(support_bottom, color=surface_color, linewidth=1.0)
     half_top = 0.5 * geometry["top_width"]
     for center in geometry["centers"]:
         vertices = [

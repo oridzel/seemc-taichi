@@ -57,7 +57,10 @@ def _parser():
     p.add_argument("--top-width-nm", type=float, default=50.0)
     p.add_argument("--bottom-width-nm", type=float, default=70.0)
     p.add_argument("--height-nm", type=float, default=50.0)
-    p.add_argument("--suspended", action="store_true",
+    support = p.add_mutually_exclusive_group()
+    support.add_argument("--membrane-thickness-nm", type=float, default=None,
+                         help="finite support thickness below z=0; omitted means bulk substrate")
+    support.add_argument("--suspended", action="store_true",
                    help="finite-thickness lines with vacuum below and in the gaps")
     p.add_argument("--n-lines", type=int, default=1)
     p.add_argument(
@@ -247,6 +250,10 @@ def main(argv=None):
     p = _parser()
     args = p.parse_args(argv)
     precision = _validate_args(p, args)
+    if args.membrane_thickness_nm is not None and (
+        not math.isfinite(args.membrane_thickness_nm) or args.membrane_thickness_nm <= 0
+    ):
+        p.error("--membrane-thickness-nm must be finite and positive")
 
     geometry = TrapezoidGeometryConfig(
         top_width=10.0 * args.top_width_nm,
@@ -255,6 +262,8 @@ def main(argv=None):
         n_lines=args.n_lines,
         pitch=10.0 * args.pitch_nm,
         suspended=args.suspended,
+        membrane_thickness=(None if args.membrane_thickness_nm is None
+                            else 10.0 * args.membrane_thickness_nm),
     ).validate()
     array_span_nm = geometry.span / 10.0
     field_width_nm = (
@@ -416,6 +425,7 @@ def main(argv=None):
     geometry_metadata = {
         "type": "TrapezoidalLineArray",
         "suspended": geometry.suspended,
+        "membrane_thickness": geometry.membrane_thickness,
         "top_width": geometry.top_width,
         "bottom_width": geometry.bottom_width,
         "height": geometry.height,
@@ -463,12 +473,15 @@ def main(argv=None):
         "barrier_model": surface.barrier_model,
         "inner_potential_ev": surface.inner_potential_ev,
         "suspended": geometry.suspended,
+        "membrane_thickness": geometry.membrane_thickness,
         "signal_convention": "all-direction legacy channels exclude vacuum misses; use back_* for uz<0",
         "se1_definition": "generation==1 and own_inelastic_count==0",
         "geometry_convention": (
             "line tops z=-height; bottom z=0; vacuum outside finite lines; lines infinite y"
             if geometry.suspended else
-            "vacuum negative z; line tops z=-height; substrate z=0; lines infinite y"
+            ("line tops z=-height; membrane from z=0 to membrane_thickness; vacuum below; lines infinite y"
+             if geometry.membrane_thickness is not None else
+             "vacuum negative z; line tops z=-height; substrate z=0; lines infinite y")
         ),
         "geometry": geometry_metadata,
         "config": {

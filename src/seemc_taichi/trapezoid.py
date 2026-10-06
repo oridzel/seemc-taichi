@@ -1,7 +1,7 @@
 """Taichi transport for supported or suspended trapezoidal SEM lines.
 
 Coordinates follow seemc-imaging: the incident beam travels toward positive z.
-Each line occupies -height <= z <= 0. A bulk substrate occupies z >= 0 unless
+Each line occupies -height <= z <= 0. A support occupies z >= 0 (ending at membrane_thickness when set) unless
 geometry.suspended is true, in which case the bottom is a solid/vacuum surface. Lines
 are infinite along y.  Every solid transport leg is truncated at the first
 exposed solid/vacuum boundary before collision physics is applied.  A particle
@@ -42,8 +42,14 @@ class TrapezoidGeometryConfig:
     n_lines: int = 1
     pitch: float | None = None
     suspended: bool = False
+    membrane_thickness: float | None = None  # Angstrom; None means bulk support
 
     def validate(self):
+        if self.membrane_thickness is not None:
+            if self.suspended:
+                raise ValueError("membrane_thickness and suspended are mutually exclusive")
+            if not math.isfinite(self.membrane_thickness) or self.membrane_thickness <= 0:
+                raise ValueError("membrane_thickness must be finite and positive")
         vals = tuple(
             float(v)
             for v in (self.top_width, self.bottom_width, self.height, self.center_x)
@@ -174,6 +180,9 @@ class TrapezoidGeometryConfig:
                 abs(x_hit - center) < b - eps for center in self.line_centers
             )
             consider(distance, 0.0, -1.0, 4, -1, not covered)
+        if self.membrane_thickness is not None and uz < -eps:
+            distance = (self.membrane_thickness - z) / uz
+            consider(distance, 0.0, 1.0, 5, -1, True)
         return best
 
 
@@ -293,6 +302,8 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
     barrier_abrupt = surface_model == "abrupt"
     bse_cutoff = float(bse_cutoff_ev)
     suspended = bool(geometry.suspended)
+    finite_membrane = geometry.membrane_thickness is not None
+    membrane_depth = float(geometry.membrane_thickness or 0.0)
     geom_a = 0.5 * float(geometry.top_width)
     geom_b = 0.5 * float(geometry.bottom_width)
     geom_h = float(geometry.height)
@@ -939,6 +950,18 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
                             nx_best = fp(0.0)
                             nz_best = fp(-1.0)
                             code = ti.i32(4)
+        if ti.static(finite_membrane):
+            # Continuous support ends here; z=0 under the ridge is not an interface.
+            if uz > fp(1.0e-15):
+                t = (fp(membrane_depth) - z) / uz
+                if t >= fp(-geom_eps) and t <= max_distance + fp(geom_eps):
+                    tt = ti.max(t, fp(0.0))
+                    if tt < best:
+                        hit = ti.i32(1)
+                        best = tt
+                        nx_best = fp(0.0)
+                        nz_best = fp(1.0)
+                        code = ti.i32(5)
         return hit, best, nx_best, nz_best, code
 
     @ti.func
@@ -1043,6 +1066,15 @@ def build_trapezoid_kernels(ti, pool, tables, fp, physics, surface, geometry, co
                         nx_best = fp(0.0)
                         nz_best = fp(-1.0)
                         code = ti.i32(4)
+        if ti.static(finite_membrane):
+            if uz < fp(-1.0e-15):
+                t = (fp(membrane_depth) - z) / uz
+                if t > fp(geom_eps) and t < best:
+                    hit = ti.i32(1)
+                    best = t
+                    nx_best = fp(0.0)
+                    nz_best = fp(1.0)
+                    code = ti.i32(5)
         return hit, best, nx_best, nz_best, code
 
     @ti.func

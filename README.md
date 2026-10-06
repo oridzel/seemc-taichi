@@ -1,3 +1,7 @@
+# Finite membrane support (v0.9.3)
+
+See [MEMBRANE_SI.md](MEMBRANE_SI.md) for the new `--membrane-thickness-nm` option and Si scan commands.
+
 # v0.9.2: suspended Si lines
 
 Use `--suspended` for finite lines with vacuum below and between them.
