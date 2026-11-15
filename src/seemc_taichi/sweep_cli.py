@@ -29,6 +29,30 @@ def _parser() -> argparse.ArgumentParser:
     )
     p.add_argument("database")
     p.add_argument("--material", default="Si")
+    p.add_argument(
+        "--substrate", default=None,
+        help="layered target: --material is a film of --film-thickness-nm on this "
+             "semi-infinite substrate material (e.g. --material C --substrate W)",
+    )
+    p.add_argument(
+        "--film-thickness-nm", type=float, default=None,
+        help="film thickness [nm]; required with --substrate",
+    )
+    p.add_argument(
+        "--interface-alignment", choices=("vacuum", "fermi"), default="vacuum",
+        help="band alignment at the film/substrate interface: common vacuum level "
+             "(default) or common Fermi level",
+    )
+    p.add_argument(
+        "--interface-model", choices=("abrupt", "classical", "expqm"), default=None,
+        help="reflection model of the interface potential step "
+             "(default: same as the surface barrier model)",
+    )
+    p.add_argument(
+        "--label", default=None,
+        help="material label written to the CSV/NPZ files "
+             "(default for a layered target: <film><t>nm_on_<substrate>)",
+    )
     p.add_argument("--arch", choices=("cpu", "metal", "cuda", "vulkan", "gpu"), default="cpu")
     p.add_argument("--precision", choices=("f32", "f64"), default=None)
     p.add_argument(
@@ -116,6 +140,18 @@ def main(argv=None) -> int:
         p.error("--capacity must be >= --n")
     if args.steps_per_chunk < 1:
         p.error("--steps-per-chunk must be positive")
+    layered = args.substrate is not None
+    if layered and not (args.film_thickness_nm and args.film_thickness_nm > 0.0):
+        p.error("--substrate requires --film-thickness-nm > 0")
+    if not layered and args.film_thickness_nm is not None:
+        p.error("--film-thickness-nm requires --substrate")
+    film_material = args.material
+    if layered:
+        args.material = args.label or (
+            f"{film_material}{args.film_thickness_nm:g}nm_on_{args.substrate}"
+        )
+    elif args.label:
+        args.material = args.label
 
     energies = [float(x) for x in args.energies]
     angles = [float(args.angle)] if args.angle is not None else [float(x) for x in args.angles]
@@ -146,7 +182,7 @@ def main(argv=None) -> int:
                 )
     rows = dict(existing)
 
-    sample, host = load_reference_plane_tables(args.database, args.material)
+    sample, host = load_reference_plane_tables(args.database, film_material)
     bulk = BulkPhysicsConfig.from_sample(sample)
     surface = SurfacePhysicsConfig.from_sample(sample)
     cutoff = float(getattr(sample.cfg, "bse_cutoff_ev", 50.0))
@@ -160,9 +196,21 @@ def main(argv=None) -> int:
     )
     ti = init_taichi(cfg)
     fp = ti.f32 if precision == "f32" else ti.f64
-    engine = PlaneTransportEngine(
-        ti, fp, host, bulk, surface, args.capacity, bse_cutoff_ev=cutoff
-    )
+    if layered:
+        from .layered_plane import LayeredPlaneTransportEngine
+
+        sub_sample, sub_host = load_reference_plane_tables(args.database, args.substrate)
+        sub_bulk = BulkPhysicsConfig.from_sample(sub_sample)
+        engine = LayeredPlaneTransportEngine(
+            ti, fp, host, sub_host, bulk, sub_bulk, surface, args.capacity,
+            film_thickness_nm=args.film_thickness_nm, bse_cutoff_ev=cutoff,
+            interface_alignment=args.interface_alignment,
+            interface_model=args.interface_model,
+        )
+    else:
+        engine = PlaneTransportEngine(
+            ti, fp, host, bulk, surface, args.capacity, bse_cutoff_ev=cutoff
+        )
 
     points = [(energy, angle) for angle in angles for energy in energies]
     pending = []
@@ -198,6 +246,18 @@ def main(argv=None) -> int:
     print(f"material: {args.material} ({kind})")
     print(f"arch / precision: {args.arch} / {precision}")
     print(f"barrier: {surface.barrier_model}; Ui={surface.inner_potential_ev:.9g} eV")
+    if layered:
+        info = engine.describe()
+        print(
+            f"layered target: {film_material} film {info['film_thickness_nm']:g} nm on "
+            f"{args.substrate}; interface {info['interface_model']}, "
+            f"{info['interface_alignment']}-level alignment, "
+            f"dV(film->substrate)={info['interface_dV_eV']:+.4g} eV"
+        )
+        print(
+            f"  film Ui={host.inner_potential_ev:.6g} eV, EF={host.e_fermi_ev:.6g} eV; "
+            f"substrate Ui={sub_host.inner_potential_ev:.6g} eV, EF={sub_host.e_fermi_ev:.6g} eV"
+        )
     print(f"points to run: {len(pending)} / {len(points)}")
     print(f"output: {output}")
     if emissions_dir is not None:
