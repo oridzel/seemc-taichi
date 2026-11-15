@@ -35,6 +35,19 @@ def _parser() -> argparse.ArgumentParser:
              "semi-infinite substrate material (e.g. --material C --substrate W)",
     )
     p.add_argument(
+        "--substrate-database",
+        help="database file for the substrate (default: the positional database)",
+    )
+    p.add_argument(
+        "--q-unit", choices=("a0^-1", "A^-1"),
+        help="momentum unit of the positional database; only needed when the database "
+             "entry has no 'q_unit' key, and must agree with it otherwise",
+    )
+    p.add_argument(
+        "--substrate-q-unit", choices=("a0^-1", "A^-1"),
+        help="momentum units in the substrate database (default: same as --q-unit)",
+    )
+    p.add_argument(
         "--film-thickness-nm", type=float, default=None,
         help="film thickness [nm]; required with --substrate",
     )
@@ -99,6 +112,7 @@ def _save_emissions(path: Path, result: dict, row: dict) -> None:
     np.savez_compressed(
         path,
         material=np.asarray(row["material"]),
+        q_unit=np.asarray(str(row.get("q_unit", ""))),
         energy_eV=np.asarray(float(row["energy_eV"])),
         angle_deg=np.asarray(float(row["angle_deg"])),
         n_primaries=np.asarray(int(row["n_primaries"])),
@@ -145,6 +159,8 @@ def main(argv=None) -> int:
         p.error("--substrate requires --film-thickness-nm > 0")
     if not layered and args.film_thickness_nm is not None:
         p.error("--film-thickness-nm requires --substrate")
+    if not layered and (args.substrate_database is not None or args.substrate_q_unit is not None):
+        p.error("--substrate-database and --substrate-q-unit require --substrate")
     film_material = args.material
     if layered:
         args.material = args.label or (
@@ -164,10 +180,27 @@ def main(argv=None) -> int:
     if output.exists() and not args.resume and not args.overwrite:
         p.error(f"{output} already exists; use --resume or --overwrite")
 
+    # Resolve the momentum unit of every material now, from the database
+    # itself, so that it is part of what a resumed sweep must agree with.
+    from .q_units import QUnitError, resolve_q_unit
+    try:
+        film_q_unit = resolve_q_unit(args.database, film_material, args.q_unit)
+        q_unit_label = film_q_unit
+        if layered:
+            sub_q_unit = resolve_q_unit(
+                args.substrate_database or args.database, args.substrate,
+                args.substrate_q_unit or (args.q_unit if args.substrate_database is None else None),
+            )
+            if sub_q_unit != film_q_unit:
+                q_unit_label = f"{film_q_unit}|{sub_q_unit}"
+    except QUnitError as exc:
+        p.error(str(exc))
+
     existing = load_csv_rows(output) if (args.resume and output.exists()) else {}
     if existing:
         exemplar = next(iter(existing.values()))
         expected = {
+            "q_unit": q_unit_label,
             "material": str(args.material),
             "arch": str(args.arch),
             "precision": str(precision),
@@ -182,7 +215,7 @@ def main(argv=None) -> int:
                 )
     rows = dict(existing)
 
-    sample, host = load_reference_plane_tables(args.database, film_material)
+    sample, host = load_reference_plane_tables(args.database, film_material, q_unit=film_q_unit)
     bulk = BulkPhysicsConfig.from_sample(sample)
     surface = SurfacePhysicsConfig.from_sample(sample)
     cutoff = float(getattr(sample.cfg, "bse_cutoff_ev", 50.0))
@@ -199,7 +232,9 @@ def main(argv=None) -> int:
     if layered:
         from .layered_plane import LayeredPlaneTransportEngine
 
-        sub_sample, sub_host = load_reference_plane_tables(args.database, args.substrate)
+        sub_sample, sub_host = load_reference_plane_tables(
+            args.substrate_database or args.database, args.substrate, q_unit=sub_q_unit,
+        )
         sub_bulk = BulkPhysicsConfig.from_sample(sub_sample)
         engine = LayeredPlaneTransportEngine(
             ti, fp, host, sub_host, bulk, sub_bulk, surface, args.capacity,
@@ -246,6 +281,7 @@ def main(argv=None) -> int:
     print(f"material: {args.material} ({kind})")
     print(f"arch / precision: {args.arch} / {precision}")
     print(f"barrier: {surface.barrier_model}; Ui={surface.inner_potential_ev:.9g} eV")
+    print(f"momentum unit of the database tables: {q_unit_label} (taken from the database entry or --q-unit)")
     if layered:
         info = engine.describe()
         print(
@@ -258,6 +294,7 @@ def main(argv=None) -> int:
             f"  film Ui={host.inner_potential_ev:.6g} eV, EF={host.e_fermi_ev:.6g} eV; "
             f"substrate Ui={sub_host.inner_potential_ev:.6g} eV, EF={sub_host.e_fermi_ev:.6g} eV"
         )
+        print(f"  q units in database: film {sample.cfg.q_unit}; substrate {sub_sample.cfg.q_unit}")
     print(f"points to run: {len(pending)} / {len(points)}")
     print(f"output: {output}")
     if emissions_dir is not None:
@@ -290,6 +327,7 @@ def main(argv=None) -> int:
             steps_per_chunk=args.steps_per_chunk,
             seed=args.seed,
             elapsed_s=elapsed,
+            q_unit=q_unit_label,
         )
         rows[point_key(energy, angle)] = row
         write_csv_rows(output, rows)

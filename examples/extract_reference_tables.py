@@ -8,7 +8,8 @@ p.add_argument("--material", default="Si")
 args = p.parse_args()
 
 _, MCConfig, _, Sample = require_reference()
-sample = Sample(args.material, db_path=args.database, config=MCConfig())
+from seemc_taichi.q_units import make_reference_sample
+sample = make_reference_sample(args.database, args.material)
 t = extract_reference_tables(sample)
 print("material:", args.material)
 print("kind:", "metal" if t.is_metal else "nonconductor")

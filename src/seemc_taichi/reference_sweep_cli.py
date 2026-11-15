@@ -31,6 +31,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("database")
     p.add_argument("--material", default="Si")
     p.add_argument(
+        "--q-unit", choices=("a0^-1", "A^-1"),
+        help="momentum unit of the database; only needed when the database entry "
+             "has no 'q_unit' key, and must agree with it otherwise",
+    )
+    p.add_argument(
         "--energies", type=float, nargs="+", default=list(DEFAULT_ENERGIES),
         help="incident vacuum energies [eV] (default: 100 500 1000 5000)",
     )
@@ -90,8 +95,11 @@ def main(argv=None) -> int:
             "python3 -m pip install -e '.[reference]'"
         ) from exc
 
-    base_cfg = MCConfig()
-    base_sample = Sample(args.material, db_path=str(args.database), config=base_cfg)
+    from .q_units import make_reference_sample
+
+    base_sample = make_reference_sample(
+        args.database, args.material, q_unit=getattr(args, "q_unit", None)
+    )
     # Preserve every material/config convention used by the reference sample,
     # but force event-level emissions on.
     try:

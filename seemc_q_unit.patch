@@ -1,0 +1,497 @@
+diff --git a/LAYERED_PLANE.md b/LAYERED_PLANE.md
+index 3aa1de1..be36e8d 100644
+--- a/LAYERED_PLANE.md
++++ b/LAYERED_PLANE.md
+@@ -29,9 +29,9 @@ load_default_surface_models(..., grid_mesh_sampler_dir="sampler_library/C70nm_on
+ ```
+ 
+ Use `--substrate-database` when the film and substrate are stored in separate
+-files. Set `--q-unit 'A^-1'` for tables in inverse ångströms. This applies to
+-both materials unless `--substrate-q-unit` is set. The legacy default is
+-`a0^-1` (inverse Bohr). Use a fresh output path when changing the materials,
++files. The momentum unit is read from each database entry (`q_unit`); `--q-unit` and
++`--substrate-q-unit` are needed only for entries without that key and must
++agree with it otherwise. There is no default unit. Use a fresh output path when changing the materials,
+ momentum units, or interface settings so that the sweep starts with those
+ settings at every grid point.
+ 
+diff --git a/examples/extract_reference_tables.py b/examples/extract_reference_tables.py
+index 8c3a409..64e35b1 100644
+--- a/examples/extract_reference_tables.py
++++ b/examples/extract_reference_tables.py
+@@ -8,7 +8,8 @@ p.add_argument("--material", default="Si")
+ args = p.parse_args()
+ 
+ _, MCConfig, _, Sample = require_reference()
+-sample = Sample(args.material, db_path=args.database, config=MCConfig())
++from seemc_taichi.q_units import make_reference_sample
++sample = make_reference_sample(args.database, args.material)
+ t = extract_reference_tables(sample)
+ print("material:", args.material)
+ print("kind:", "metal" if t.is_metal else "nonconductor")
+diff --git a/examples/validate_layered_plane.py b/examples/validate_layered_plane.py
+index 0692bb2..a69a07b 100644
+--- a/examples/validate_layered_plane.py
++++ b/examples/validate_layered_plane.py
+@@ -52,7 +52,7 @@ def main():
+     film_sample, film = load_reference_plane_tables(a.database, a.film, q_unit=a.q_unit)
+     sub_sample, sub = load_reference_plane_tables(
+         a.substrate_database or a.database, a.substrate,
+-        q_unit=a.substrate_q_unit or a.q_unit,
++        q_unit=a.substrate_q_unit or (a.q_unit if a.substrate_database is None else None),
+     )
+     film_bulk = BulkPhysicsConfig.from_sample(film_sample)
+     sub_bulk = BulkPhysicsConfig.from_sample(sub_sample)
+diff --git a/sampler_adapter/taichi_to_sampler_library.py b/sampler_adapter/taichi_to_sampler_library.py
+index 6868ea6..40b9843 100644
+--- a/sampler_adapter/taichi_to_sampler_library.py
++++ b/sampler_adapter/taichi_to_sampler_library.py
+@@ -65,6 +65,10 @@ def convert_case(path):
+             case_seed=None, missing_provenance=['database_sha256','config','case_seed'],
+             classification='SE: Eout < cutoff; BSE: Eout >= cutoff',
+             barrier_reflection_probability_available=False)
++        # Momentum unit the transport tables were read with (written by the
++        # sweep since the q-unit fix).  A library without it predates the fix
++        # and may have been generated with the wrong unit.
++        metadata['q_unit'] = (str(z['q_unit'].item()) if 'q_unit' in z.files else None) or 'unknown'
+         payload['metadata_json'] = np.asarray(json.dumps(metadata,sort_keys=True))
+     case = ExportCase(**{k:(v.item() if v.ndim==0 else v) for k,v in payload.items()})
+     case.validate()
+diff --git a/src/seemc_taichi/bulk.py b/src/seemc_taichi/bulk.py
+index 05840c8..8cd11ff 100644
+--- a/src/seemc_taichi/bulk.py
++++ b/src/seemc_taichi/bulk.py
+@@ -864,13 +864,10 @@ class BulkTransportEngine:
+         return out
+ 
+ 
+-def load_reference_bulk_tables(database_path, material="Si", config=None):
+-    try:
+-        from seemc_imaging.transport import MCConfig, Sample
+-    except ImportError as exc:
+-        raise RuntimeError("Install seemc-imaging or use the reference extra") from exc
+-    cfg = config or MCConfig()
+-    sample = Sample(material, db_path=str(database_path), config=cfg)
++def load_reference_bulk_tables(database_path, material="Si", config=None, *, q_unit=None):
++    from .q_units import make_reference_sample
++
++    sample = make_reference_sample(database_path, material, config=config, q_unit=q_unit)
+     return sample, extract_reference_tables(sample)
+ 
+ 
+diff --git a/src/seemc_taichi/elastic.py b/src/seemc_taichi/elastic.py
+index fc3958b..3e4b959 100644
+--- a/src/seemc_taichi/elastic.py
++++ b/src/seemc_taichi/elastic.py
+@@ -253,15 +253,10 @@ def run_elastic_transport(ti, fp, host_tables, *, physics, n=100_000,
+                       collisions=collisions, copy_state=copy_state)
+ 
+ 
+-def load_reference_host_tables(database_path, material="Si", config=None):
+-    try:
+-        from seemc_imaging.transport import MCConfig, Sample
+-    except ImportError as exc:
+-        raise RuntimeError(
+-            "Install seemc-imaging>=0.7.4 or this package with the reference extra"
+-        ) from exc
+-    cfg = config or MCConfig()
+-    sample = Sample(material, db_path=str(database_path), config=cfg)
++def load_reference_host_tables(database_path, material="Si", config=None, *, q_unit=None):
++    from .q_units import make_reference_sample
++
++    sample = make_reference_sample(database_path, material, config=config, q_unit=q_unit)
+     return sample, extract_reference_tables(sample)
+ 
+ 
+diff --git a/src/seemc_taichi/plane.py b/src/seemc_taichi/plane.py
+index b31464a..053209b 100644
+--- a/src/seemc_taichi/plane.py
++++ b/src/seemc_taichi/plane.py
+@@ -1178,14 +1178,9 @@ def yield_sem_from_counts(counts):
+ 
+ 
+ def load_reference_plane_tables(database_path, material="Si", config=None, *, q_unit=None):
+-    try:
+-        from seemc_imaging.transport import MCConfig, Sample
+-    except ImportError as exc:
+-        raise RuntimeError("Install seemc-imaging or use the reference extra") from exc
+-    cfg = config or MCConfig()
+-    if q_unit is not None:
+-        cfg = replace(cfg, q_unit=q_unit)
+-    sample = Sample(material, db_path=str(database_path), config=cfg)
++    from .q_units import make_reference_sample
++
++    sample = make_reference_sample(database_path, material, config=config, q_unit=q_unit)
+     return sample, extract_reference_tables(sample)
+ 
+ 
+diff --git a/src/seemc_taichi/q_units.py b/src/seemc_taichi/q_units.py
+new file mode 100644
+index 0000000..88e3379
+--- /dev/null
++++ b/src/seemc_taichi/q_units.py
+@@ -0,0 +1,129 @@
++"""Momentum units of the material database, and the one place where a
++reference material sample is created.
++
++Every seemc-taichi loader builds its tables from a ``seemc_imaging`` ``Sample``.
++The momentum-transfer grid of a database entry can be stored in inverse Bohr
++radii (``a0^-1``) or inverse Angstrom (``A^-1``), and ``MCConfig`` defaults to
++``a0^-1`` whatever the database says.  Reading an ``A^-1`` database with the
++default therefore runs without any error and gives wrong inelastic kinematics
++(and wrong secondary yields).
++
++``make_reference_sample`` removes the default.  The unit is taken from the
++database entry (key ``q_unit``); an explicit request must agree with it; and a
++database entry without the key is refused unless the unit is given
++explicitly.  Use ``tools/stamp_q_unit.py`` to add the key to an old database.
++"""
++from __future__ import annotations
++
++import os
++import pickle
++from dataclasses import replace
++from functools import lru_cache
++from pathlib import Path
++
++Q_UNITS = ("a0^-1", "A^-1")
++_ALIASES = {
++    "a0^-1": "a0^-1", "a0-1": "a0^-1", "1/a0": "a0^-1", "bohr^-1": "a0^-1",
++    "1/bohr": "a0^-1", "a.u.": "a0^-1", "au": "a0^-1",
++    "a^-1": "A^-1", "a-1": "A^-1", "1/a": "A^-1", "angstrom^-1": "A^-1",
++    "1/angstrom": "A^-1", "å^-1": "A^-1", "1/å": "A^-1", "å⁻¹": "A^-1", "a⁻¹": "A^-1",
++}
++
++
++class QUnitError(RuntimeError):
++    pass
++
++
++def normalise_q_unit(unit) -> str:
++    """Canonical spelling of a momentum unit, or raise."""
++    if unit in Q_UNITS:           # exact, case-sensitive: "A^-1" vs "a0^-1"
++        return unit
++    key = str(unit).strip().lower().replace(" ", "")
++    if key in _ALIASES:
++        return _ALIASES[key]
++    raise QUnitError(f"unknown momentum unit {unit!r}; use one of {Q_UNITS}")
++
++
++def _entries(database):
++    if isinstance(database, dict):
++        if "name" in database and not all(isinstance(v, dict) for v in database.values()):
++            return [database]
++        return [dict(v, name=v.get("name", k)) for k, v in database.items() if isinstance(v, dict)]
++    return [e for e in database if isinstance(e, dict)]
++
++
++@lru_cache(maxsize=8)
++def _database_units(path: str, mtime_ns: int, size: int) -> dict:
++    with open(path, "rb") as f:
++        database = pickle.load(f)
++    out = {}
++    for entry in _entries(database):
++        name = entry.get("name")
++        if name is None:
++            continue
++        unit = entry.get("q_unit")
++        out[str(name)] = None if unit is None else normalise_q_unit(unit)
++    return out
++
++
++def database_q_unit(database_path, material) -> str | None:
++    """Unit recorded in the database entry of ``material`` (None if absent)."""
++    path = Path(database_path)
++    st = path.stat()
++    units = _database_units(str(path), st.st_mtime_ns, st.st_size)
++    if str(material) not in units:
++        raise QUnitError(
++            f"material {material!r} not found in {path} (entries: {sorted(units)})"
++        )
++    return units[str(material)]
++
++
++def resolve_q_unit(database_path, material, q_unit=None) -> str:
++    """The momentum unit to use for ``material``; never a silent default."""
++    recorded = database_q_unit(database_path, material)
++    requested = None if q_unit is None else normalise_q_unit(q_unit)
++    if requested is None:
++        env = os.environ.get("SEEMC_Q_UNIT")
++        if env and recorded is None:
++            requested = normalise_q_unit(env)
++    if recorded is not None:
++        if requested is not None and requested != recorded:
++            raise QUnitError(
++                f"{material}: database {Path(database_path).name} records q_unit="
++                f"{recorded!r} but {requested!r} was requested. Fix the request or the database."
++            )
++        return recorded
++    if requested is not None:
++        return requested
++    raise QUnitError(
++        f"{material}: the entry in {Path(database_path).name} has no 'q_unit' key, so the "
++        f"momentum unit is unknown. Pass q_unit explicitly (--q-unit on the command line, "
++        f"or SEEMC_Q_UNIT in the environment), or record it once with "
++        f"tools/stamp_q_unit.py. Units: {Q_UNITS}."
++    )
++
++
++def make_reference_sample(database_path, material="Si", config=None, q_unit=None):
++    """``seemc_imaging`` Sample with the momentum unit of the database entry."""
++    try:
++        from seemc_imaging.transport import MCConfig, Sample
++    except ImportError as exc:
++        raise RuntimeError(
++            "Install seemc-imaging or this package with the reference extra"
++        ) from exc
++    unit = resolve_q_unit(database_path, material, q_unit)
++    cfg = config or MCConfig()
++    if not hasattr(cfg, "q_unit"):
++        raise QUnitError(
++            "this seemc-imaging version has no MCConfig.q_unit; it cannot read a "
++            f"database in {unit!r}. Update seemc-imaging."
++        )
++    if cfg.q_unit != unit:
++        cfg = replace(cfg, q_unit=unit)
++    sample = Sample(material, db_path=str(database_path), config=cfg)
++    used = getattr(getattr(sample, "cfg", cfg), "q_unit", None)
++    if used != unit:
++        raise QUnitError(
++            f"{material}: requested q_unit={unit!r} but the sample was built with {used!r}"
++        )
++    return sample
+diff --git a/src/seemc_taichi/reference.py b/src/seemc_taichi/reference.py
+index 8bb70db..14a6eba 100644
+--- a/src/seemc_taichi/reference.py
++++ b/src/seemc_taichi/reference.py
+@@ -18,7 +18,13 @@ def require_reference():
+ def run_reference_plane(database_path, material, energy_ev, angle_deg, n_primaries,
+                         *, config=None, seed=12345, workers=1):
+     Plane, MCConfig, SEEMC, _ = require_reference()
++    # Momentum unit from the database entry, never the MCConfig default.
++    from dataclasses import replace
++    from .q_units import resolve_q_unit
+     config = config or MCConfig()
++    unit = resolve_q_unit(database_path, material)
++    if getattr(config, "q_unit", None) != unit:
++        config = replace(config, q_unit=unit)
+     alpha = math.radians(float(angle_deg))
+     vacuum = (math.sin(alpha), 0.0, math.cos(alpha))
+     outward = (0.0, 0.0, -1.0)
+diff --git a/src/seemc_taichi/reference_sweep_cli.py b/src/seemc_taichi/reference_sweep_cli.py
+index 77e13b9..c1fc577 100644
+--- a/src/seemc_taichi/reference_sweep_cli.py
++++ b/src/seemc_taichi/reference_sweep_cli.py
+@@ -30,6 +30,11 @@ def _parser() -> argparse.ArgumentParser:
+     )
+     p.add_argument("database")
+     p.add_argument("--material", default="Si")
++    p.add_argument(
++        "--q-unit", choices=("a0^-1", "A^-1"),
++        help="momentum unit of the database; only needed when the database entry "
++             "has no 'q_unit' key, and must agree with it otherwise",
++    )
+     p.add_argument(
+         "--energies", type=float, nargs="+", default=list(DEFAULT_ENERGIES),
+         help="incident vacuum energies [eV] (default: 100 500 1000 5000)",
+@@ -90,8 +95,11 @@ def main(argv=None) -> int:
+             "python3 -m pip install -e '.[reference]'"
+         ) from exc
+ 
+-    base_cfg = MCConfig()
+-    base_sample = Sample(args.material, db_path=str(args.database), config=base_cfg)
++    from .q_units import make_reference_sample
++
++    base_sample = make_reference_sample(
++        args.database, args.material, q_unit=getattr(args, "q_unit", None)
++    )
+     # Preserve every material/config convention used by the reference sample,
+     # but force event-level emissions on.
+     try:
+diff --git a/src/seemc_taichi/sweep.py b/src/seemc_taichi/sweep.py
+index f2140b8..3dd55d1 100644
+--- a/src/seemc_taichi/sweep.py
++++ b/src/seemc_taichi/sweep.py
+@@ -45,6 +45,7 @@ DIAGNOSTIC_FIELDS = (
+ CSV_FIELDS = (
+     "material",
+     "material_kind",
++    "q_unit",
+     "arch",
+     "precision",
+     "barrier_model",
+@@ -118,6 +119,7 @@ def build_sweep_row(
+     steps_per_chunk: int,
+     seed: int,
+     elapsed_s: float,
++    q_unit: str = "",
+ ) -> dict:
+     diag = result["diagnostics"]
+     valid, status = result_is_valid(result)
+@@ -134,6 +136,7 @@ def build_sweep_row(
+     row = {
+         "material": material,
+         "material_kind": material_kind,
++        "q_unit": q_unit,
+         "arch": arch,
+         "precision": precision,
+         "barrier_model": barrier_model,
+diff --git a/src/seemc_taichi/sweep_cli.py b/src/seemc_taichi/sweep_cli.py
+index 365d715..9f15af0 100644
+--- a/src/seemc_taichi/sweep_cli.py
++++ b/src/seemc_taichi/sweep_cli.py
+@@ -40,7 +40,8 @@ def _parser() -> argparse.ArgumentParser:
+     )
+     p.add_argument(
+         "--q-unit", choices=("a0^-1", "A^-1"),
+-        help="momentum units in the positional database (legacy default: a0^-1)",
++        help="momentum unit of the positional database; only needed when the database "
++             "entry has no 'q_unit' key, and must agree with it otherwise",
+     )
+     p.add_argument(
+         "--substrate-q-unit", choices=("a0^-1", "A^-1"),
+@@ -111,6 +112,7 @@ def _save_emissions(path: Path, result: dict, row: dict) -> None:
+     np.savez_compressed(
+         path,
+         material=np.asarray(row["material"]),
++        q_unit=np.asarray(str(row.get("q_unit", ""))),
+         energy_eV=np.asarray(float(row["energy_eV"])),
+         angle_deg=np.asarray(float(row["angle_deg"])),
+         n_primaries=np.asarray(int(row["n_primaries"])),
+@@ -178,10 +180,27 @@ def main(argv=None) -> int:
+     if output.exists() and not args.resume and not args.overwrite:
+         p.error(f"{output} already exists; use --resume or --overwrite")
+ 
++    # Resolve the momentum unit of every material now, from the database
++    # itself, so that it is part of what a resumed sweep must agree with.
++    from .q_units import QUnitError, resolve_q_unit
++    try:
++        film_q_unit = resolve_q_unit(args.database, film_material, args.q_unit)
++        q_unit_label = film_q_unit
++        if layered:
++            sub_q_unit = resolve_q_unit(
++                args.substrate_database or args.database, args.substrate,
++                args.substrate_q_unit or (args.q_unit if args.substrate_database is None else None),
++            )
++            if sub_q_unit != film_q_unit:
++                q_unit_label = f"{film_q_unit}|{sub_q_unit}"
++    except QUnitError as exc:
++        p.error(str(exc))
++
+     existing = load_csv_rows(output) if (args.resume and output.exists()) else {}
+     if existing:
+         exemplar = next(iter(existing.values()))
+         expected = {
++            "q_unit": q_unit_label,
+             "material": str(args.material),
+             "arch": str(args.arch),
+             "precision": str(precision),
+@@ -196,7 +215,7 @@ def main(argv=None) -> int:
+                 )
+     rows = dict(existing)
+ 
+-    sample, host = load_reference_plane_tables(args.database, film_material, q_unit=args.q_unit)
++    sample, host = load_reference_plane_tables(args.database, film_material, q_unit=film_q_unit)
+     bulk = BulkPhysicsConfig.from_sample(sample)
+     surface = SurfacePhysicsConfig.from_sample(sample)
+     cutoff = float(getattr(sample.cfg, "bse_cutoff_ev", 50.0))
+@@ -214,8 +233,7 @@ def main(argv=None) -> int:
+         from .layered_plane import LayeredPlaneTransportEngine
+ 
+         sub_sample, sub_host = load_reference_plane_tables(
+-            args.substrate_database or args.database, args.substrate,
+-            q_unit=args.substrate_q_unit or args.q_unit,
++            args.substrate_database or args.database, args.substrate, q_unit=sub_q_unit,
+         )
+         sub_bulk = BulkPhysicsConfig.from_sample(sub_sample)
+         engine = LayeredPlaneTransportEngine(
+@@ -263,6 +281,7 @@ def main(argv=None) -> int:
+     print(f"material: {args.material} ({kind})")
+     print(f"arch / precision: {args.arch} / {precision}")
+     print(f"barrier: {surface.barrier_model}; Ui={surface.inner_potential_ev:.9g} eV")
++    print(f"momentum unit of the database tables: {q_unit_label} (taken from the database entry or --q-unit)")
+     if layered:
+         info = engine.describe()
+         print(
+@@ -308,6 +327,7 @@ def main(argv=None) -> int:
+             steps_per_chunk=args.steps_per_chunk,
+             seed=args.seed,
+             elapsed_s=elapsed,
++            q_unit=q_unit_label,
+         )
+         rows[point_key(energy, angle)] = row
+         write_csv_rows(output, rows)
+diff --git a/src/seemc_taichi/trapezoid.py b/src/seemc_taichi/trapezoid.py
+index 6ce57b8..9df62a6 100644
+--- a/src/seemc_taichi/trapezoid.py
++++ b/src/seemc_taichi/trapezoid.py
+@@ -1850,13 +1850,10 @@ def yield_sem_from_counts(counts):
+     return float(a.std(ddof=0) / math.sqrt(a.size))
+ 
+ 
+-def load_reference_plane_tables(database_path, material="Si", config=None):
+-    try:
+-        from seemc_imaging.transport import MCConfig, Sample
+-    except ImportError as exc:
+-        raise RuntimeError("Install seemc-imaging or use the reference extra") from exc
+-    cfg = config or MCConfig()
+-    sample = Sample(material, db_path=str(database_path), config=cfg)
++def load_reference_plane_tables(database_path, material="Si", config=None, *, q_unit=None):
++    from .q_units import make_reference_sample
++
++    sample = make_reference_sample(database_path, material, config=config, q_unit=q_unit)
+     return sample, extract_reference_tables(sample)
+ 
+ 
+diff --git a/tools/stamp_q_unit.py b/tools/stamp_q_unit.py
+new file mode 100644
+index 0000000..4b18e67
+--- /dev/null
++++ b/tools/stamp_q_unit.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""Record the momentum unit in every entry of a SEEMC material database.
++
++  python3 tools/stamp_q_unit.py MaterialDatabase.pkl 'A^-1'            # report only
++  python3 tools/stamp_q_unit.py MaterialDatabase.pkl 'A^-1' --write    # add the key
++
++Entries that already carry a 'q_unit' are left alone; one that disagrees with
++the unit given here is reported and nothing is written.  A backup
++(<name>.bak) is made before writing.
++"""
++import argparse, pickle, shutil, sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++from seemc_taichi.q_units import normalise_q_unit  # noqa: E402
++
++p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++p.add_argument("database"); p.add_argument("q_unit"); p.add_argument("--write", action="store_true")
++a = p.parse_args()
++unit = normalise_q_unit(a.q_unit)
++path = Path(a.database)
++with open(path, "rb") as f:
++    db = pickle.load(f)
++entries = db if isinstance(db, list) else ([db] if "name" in db else list(db.values()))
++conflict = False; missing = 0
++for e in entries:
++    have = e.get("q_unit")
++    state = "missing" if have is None else normalise_q_unit(have)
++    if have is None:
++        missing += 1
++    elif state != unit:
++        conflict = True; state += "   <-- DIFFERENT"
++    q = e.get("q")
++    rng = "" if q is None else f"   q grid {float(min(q)):.4g} .. {float(max(q)):.4g}"
++    print(f"{str(e.get('name')):12s} q_unit: {state}{rng}")
++if conflict:
++    sys.exit("some entries record a different unit; nothing written")
++if not a.write:
++    print(f"\n{missing} entries would be stamped with {unit!r}; rerun with --write"); sys.exit(0)
++if missing:
++    shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
++    for e in entries:
++        e.setdefault("q_unit", unit)
++    with open(path, "wb") as f:
++        pickle.dump(db, f)
++print(f"stamped {missing} entries with {unit!r}" + (f"; backup {path.name}.bak" if missing else ""))

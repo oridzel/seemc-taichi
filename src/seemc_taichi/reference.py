@@ -18,7 +18,13 @@ def require_reference():
 def run_reference_plane(database_path, material, energy_ev, angle_deg, n_primaries,
                         *, config=None, seed=12345, workers=1):
     Plane, MCConfig, SEEMC, _ = require_reference()
+    # Momentum unit from the database entry, never the MCConfig default.
+    from dataclasses import replace
+    from .q_units import resolve_q_unit
     config = config or MCConfig()
+    unit = resolve_q_unit(database_path, material)
+    if getattr(config, "q_unit", None) != unit:
+        config = replace(config, q_unit=unit)
     alpha = math.radians(float(angle_deg))
     vacuum = (math.sin(alpha), 0.0, math.cos(alpha))
     outward = (0.0, 0.0, -1.0)

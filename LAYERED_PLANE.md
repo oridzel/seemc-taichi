@@ -28,6 +28,13 @@ wires at the new folder:
 load_default_surface_models(..., grid_mesh_sampler_dir="sampler_library/C70nm_on_W")
 ```
 
+Use `--substrate-database` when the film and substrate are stored in separate
+files. The momentum unit is read from each database entry (`q_unit`); `--q-unit` and
+`--substrate-q-unit` are needed only for entries without that key and must
+agree with it otherwise. There is no default unit. Use a fresh output path when changing the materials,
+momentum units, or interface settings so that the sweep starts with those
+settings at every grid point.
+
 ## Check it first
 
 ```bash
@@ -38,10 +45,20 @@ python3 examples/validate_layered_plane.py ../MaterialDatabase.pkl \
 It verifies two identities against the validated single-material engine (film
 on the same material; very thick film) and prints the C-on-W result.
 
+To test the supplied Cu and W databases separately, use:
+
+```bash
+python examples/validate_layered_plane.py ../MaterialDatabase_1.pkl \
+  --film Cu --substrate W --substrate-database ../W_Database.pkl \
+  --q-unit 'A^-1' --film-thickness-nm 2 --interface-alignment fermi \
+  --arch cpu --precision f64 --energy 500 --n 4000 --capacity 300000
+```
+
 ## Physics
 
-* Each layer uses the `plane.py` collision physics unchanged (the code block is
-  copied verbatim and instantiated once per material).
+* Each layer uses the collision physics from `plane.py` with its own material
+  tables. The layered kernel repeats failed inelastic sampling attempts in a
+  runtime loop to reduce compilation cost.
 * Interface at depth t: the energy `E_s` changes by `dV` when the electron
   changes layer, parallel momentum is conserved (refraction), and the electron
   is reflected when it cannot supply the step or, stochastically, with the

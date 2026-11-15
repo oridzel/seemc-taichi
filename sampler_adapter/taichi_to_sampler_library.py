@@ -65,6 +65,10 @@ def convert_case(path):
             case_seed=None, missing_provenance=['database_sha256','config','case_seed'],
             classification='SE: Eout < cutoff; BSE: Eout >= cutoff',
             barrier_reflection_probability_available=False)
+        # Momentum unit the transport tables were read with (written by the
+        # sweep since the q-unit fix).  A library without it predates the fix
+        # and may have been generated with the wrong unit.
+        metadata['q_unit'] = (str(z['q_unit'].item()) if 'q_unit' in z.files else None) or 'unknown'
         payload['metadata_json'] = np.asarray(json.dumps(metadata,sort_keys=True))
     case = ExportCase(**{k:(v.item() if v.ndim==0 else v) for k,v in payload.items()})
     case.validate()

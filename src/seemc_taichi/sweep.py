@@ -45,6 +45,7 @@ DIAGNOSTIC_FIELDS = (
 CSV_FIELDS = (
     "material",
     "material_kind",
+    "q_unit",
     "arch",
     "precision",
     "barrier_model",
@@ -118,6 +119,7 @@ def build_sweep_row(
     steps_per_chunk: int,
     seed: int,
     elapsed_s: float,
+    q_unit: str = "",
 ) -> dict:
     diag = result["diagnostics"]
     valid, status = result_is_valid(result)
@@ -134,6 +136,7 @@ def build_sweep_row(
     row = {
         "material": material,
         "material_kind": material_kind,
+        "q_unit": q_unit,
         "arch": arch,
         "precision": precision,
         "barrier_model": barrier_model,

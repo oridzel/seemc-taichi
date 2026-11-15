@@ -9,6 +9,7 @@ from .plane import PlaneTransportEngine, load_reference_plane_tables
 from .surface import SurfacePhysicsConfig
 from .trapezoid import TrapezoidGeometryConfig, TrapezoidTransportEngine
 from .scan_archive import RasterTrajectoryArchive
+from .layered_plane import LayeredPlaneTransportEngine
 
 __all__ = [
     "BackendConfig",
@@ -25,6 +26,7 @@ __all__ = [
     "compare_yields",
     "extract_reference_tables",
     "init_taichi",
+    "LayeredPlaneTransportEngine",
 ]
 
 __version__ = "0.9.3"

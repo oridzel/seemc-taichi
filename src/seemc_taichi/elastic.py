@@ -253,15 +253,10 @@ def run_elastic_transport(ti, fp, host_tables, *, physics, n=100_000,
                       collisions=collisions, copy_state=copy_state)
 
 
-def load_reference_host_tables(database_path, material="Si", config=None):
-    try:
-        from seemc_imaging.transport import MCConfig, Sample
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install seemc-imaging>=0.7.4 or this package with the reference extra"
-        ) from exc
-    cfg = config or MCConfig()
-    sample = Sample(material, db_path=str(database_path), config=cfg)
+def load_reference_host_tables(database_path, material="Si", config=None, *, q_unit=None):
+    from .q_units import make_reference_sample
+
+    sample = make_reference_sample(database_path, material, config=config, q_unit=q_unit)
     return sample, extract_reference_tables(sample)
 
 

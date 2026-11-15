@@ -26,6 +26,7 @@ from seemc_taichi.plane import (
 )
 from seemc_taichi.runtime import init_taichi
 from seemc_taichi.surface import SurfacePhysicsConfig
+from seemc_taichi.sweep import result_is_valid
 
 
 def main():
@@ -33,6 +34,10 @@ def main():
     p.add_argument("database")
     p.add_argument("--film", default="C")
     p.add_argument("--substrate", default="W")
+    p.add_argument("--substrate-database", help="default: the positional database")
+    p.add_argument("--q-unit", choices=("a0^-1", "A^-1"), help="film q unit")
+    p.add_argument("--substrate-q-unit", choices=("a0^-1", "A^-1"),
+                   help="substrate q unit (defaults to the film q unit)")
     p.add_argument("--film-thickness-nm", type=float, default=70.0)
     p.add_argument("--interface-alignment", choices=("vacuum", "fermi"), default="vacuum")
     p.add_argument("--arch", default="cpu")
@@ -44,8 +49,11 @@ def main():
     p.add_argument("--seed", type=int, default=20261114)
     a = p.parse_args()
 
-    film_sample, film = load_reference_plane_tables(a.database, a.film)
-    sub_sample, sub = load_reference_plane_tables(a.database, a.substrate)
+    film_sample, film = load_reference_plane_tables(a.database, a.film, q_unit=a.q_unit)
+    sub_sample, sub = load_reference_plane_tables(
+        a.substrate_database or a.database, a.substrate,
+        q_unit=a.substrate_q_unit or (a.q_unit if a.substrate_database is None else None),
+    )
     film_bulk = BulkPhysicsConfig.from_sample(film_sample)
     sub_bulk = BulkPhysicsConfig.from_sample(sub_sample)
     surface = SurfacePhysicsConfig.from_sample(film_sample)
@@ -57,8 +65,9 @@ def main():
 
     def run(tag, engine):
         r = engine.run_plane(n=a.n, energy_vac_ev=a.energy, alpha_deg=a.angle, copy_emissions=True)
-        if r["overflow"] or r["emission_overflow"]:
-            raise RuntimeError(f"{tag}: overflow; increase --capacity")
+        valid, status = result_is_valid(r)
+        if not valid:
+            raise RuntimeError(f"{tag}: invalid transport result ({status})")
         total, se, bse = per_primary_emission_counts(r, cutoff)
         e = np.asarray(r["emission_energy_ev"])
         per_primary_energy = np.bincount(r["emission_root_primary_id"], weights=e, minlength=a.n)
@@ -100,8 +109,12 @@ def main():
         ok &= worst < 3.5
         print(f"{tag:20s} vs plane {a.film}: pulls " + ", ".join(f"{k} {v:+.2f}" for k, v in pulls.items())
               + ("   OK" if worst < 3.5 else "   FAIL"))
-    print(f"\n{a.film} {a.film_thickness_nm:g} nm on {a.substrate} relative to bulk {a.film}: "
-          f"TEY x{new['tey'] / ref['tey']:.3f}, SEY x{new['sey'] / ref['sey']:.3f}, BSEY x{new['bsey'] / ref['bsey']:.3f}")
+    ratios = ", ".join(
+        f"{key.upper()} x{new[key] / ref[key]:.3f}" if ref[key] > 0
+        else f"{key.upper()} unavailable (zero bulk yield)"
+        for key in ("tey", "sey", "bsey")
+    )
+    print(f"\n{a.film} {a.film_thickness_nm:g} nm on {a.substrate} relative to bulk {a.film}: {ratios}")
     return 0 if ok else 1
 
 

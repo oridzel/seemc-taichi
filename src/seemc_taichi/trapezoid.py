@@ -1850,13 +1850,10 @@ def yield_sem_from_counts(counts):
     return float(a.std(ddof=0) / math.sqrt(a.size))
 
 
-def load_reference_plane_tables(database_path, material="Si", config=None):
-    try:
-        from seemc_imaging.transport import MCConfig, Sample
-    except ImportError as exc:
-        raise RuntimeError("Install seemc-imaging or use the reference extra") from exc
-    cfg = config or MCConfig()
-    sample = Sample(material, db_path=str(database_path), config=cfg)
+def load_reference_plane_tables(database_path, material="Si", config=None, *, q_unit=None):
+    from .q_units import make_reference_sample
+
+    sample = make_reference_sample(database_path, material, config=config, q_unit=q_unit)
     return sample, extract_reference_tables(sample)
 
 

@@ -3,14 +3,15 @@
 Geometry (same convention as ``plane.py``): vacuum z < 0, film 0 < z < t,
 substrate z > t, outward normal (0, 0, -1).
 
-The collision physics of each layer is the ``plane.py`` physics, unchanged: the
-block between the two marker comments below is copied verbatim from
-``build_plane_kernels`` (seemc-taichi 0.9.3) and instantiated once per material,
-with two edits that are marked ``LAYERED``:
+Each layer uses the collision physics from ``plane.py``. The block between
+the two marker comments below comes from ``build_plane_kernels``
+(seemc-taichi 0.9.3) and is instantiated once per material:
 
   * a secondary electron is born in the layer of its parent;
   * the "cannot escape, do not queue" threshold of a secondary is the layer's
     ``kill_energy`` instead of ``Ui`` (identical to ``Ui`` in the film).
+  * the inelastic sampling retries run in a loop to keep the compiled kernel
+    smaller.
 
 What is new is the film/substrate interface at z = t:
 
@@ -81,7 +82,7 @@ def _make_material_physics(
     ) = make_primitives(ti, fp)
     kill_energy = float(kill_energy)
 
-    # ---- BEGIN verbatim copy of plane.build_plane_kernels (0.9.3) ----
+    # ---- BEGIN collision physics from plane.build_plane_kernels (0.9.3) ----
     is_metal = bool(tables.is_metal)
     vacuum_ref = physics.emfp_energy_ref == "vacuum"
     fermi_imfp_ref = physics.imfp_energy_ref == "fermi"
@@ -394,20 +395,23 @@ def _make_material_physics(
         k = fp(0.0)
         kp = fp(0.0)
 
-        for _attempt in ti.static(range(4)):
-            if valid == ti.i32(0):
-                ok_w, w_try = sample_omega(ch, E_s)
-                if ok_w == ti.i32(1):
-                    any_omega = ti.i32(1)
-                    ok_q, q_try, k_try, kp_try, clipped = sample_q(ch, E_s, w_try)
-                    if clipped == ti.i32(1):
-                        clipped_any = ti.i32(1)
-                    if ok_q == ti.i32(1):
-                        omega = w_try
-                        q = q_try
-                        k = k_try
-                        kp = kp_try
-                        valid = ti.i32(1)
+        # Each layer inlines the q sampler. Keep one copy per layer in the
+        # compiled kernel while allowing up to four draws, as in plane.py.
+        attempt = ti.i32(0)
+        while valid == ti.i32(0) and attempt < ti.i32(4):
+            attempt += ti.i32(1)
+            ok_w, w_try = sample_omega(ch, E_s)
+            if ok_w == ti.i32(1):
+                any_omega = ti.i32(1)
+                ok_q, q_try, k_try, kp_try, clipped = sample_q(ch, E_s, w_try)
+                if clipped == ti.i32(1):
+                    clipped_any = ti.i32(1)
+                if ok_q == ti.i32(1):
+                    omega = w_try
+                    q = q_try
+                    k = k_try
+                    kp = kp_try
+                    valid = ti.i32(1)
 
         return valid, any_omega, omega, q, k, kp, clipped_any
 
@@ -744,7 +748,7 @@ def _make_material_physics(
                                 pool.overflow[None] = ti.i32(1)
         return ok_event
 
-    # ---- END verbatim copy ----
+    # ---- END collision physics from plane.build_plane_kernels ----
 
     @ti.func
     def do_elastic(i: ti.i32):
