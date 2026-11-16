@@ -66,7 +66,8 @@ def _format_number(value: float) -> str:
     return format(float(value), ".17g")
 
 def export_angle_tables(directory, cases: Sequence[PlaneSamplerCase],
-                        *, material: str, probabilities: np.ndarray) -> None:
+                        *, material: str, probabilities: np.ndarray,
+                        include_cutoff_in_se: bool = False) -> None:
     """Write the six legacy-compatible CSV tables for one incidence angle."""
     if not cases:
         raise ValueError("at least one case is required")
@@ -157,10 +158,11 @@ def export_angle_tables(directory, cases: Sequence[PlaneSamplerCase],
 
     readme = directory / "readme.txt"
     temporary = readme.with_suffix(".txt.tmp")
+    se_operator, bse_operator = ("<=", ">") if include_cutoff_in_se else ("<", ">=")
     temporary.write_text(
         f"Planar {material} emission samplers at {angle_text} degrees incidence.\n"
-        f"SE means emitted energy < {cutoff:g} eV; BSE means emitted energy "
-        f">= {cutoff:g} eV.\n"
+        f"SE means emitted energy {se_operator} {cutoff:g} eV. "
+        f"BSE means emitted energy {bse_operator} {cutoff:g} eV.\n"
         "Theta is measured from the beam-back direction (opposite the incident "
         "vacuum ray), not from the sample normal.\n"
         f"Physical polar support is 0 to {90.0 + angle:g} degrees.\n"

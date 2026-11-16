@@ -27,7 +27,7 @@ class ExportCase(SimpleNamespace):
             if len(energy) != len(ids) or counts.sum() != len(energy):
                 raise ValueError('inconsistent emission counts')
 
-def convert_case(path):
+def convert_case(path, *, include_cutoff_in_se=False):
     with np.load(path, allow_pickle=False) as z:
         if not bool(z['valid'].item()): raise ValueError(f'{path}: INVALID transport result')
         material = str(z['material'].item())
@@ -54,7 +54,8 @@ def convert_case(path):
             incidence_angle_deg=angle, n_primaries=n, case_seed=0,
             energy_cutoff_ev=cutoff, config=SimpleNamespace(), database_sha256='',
             material=material, vacuum_incident_direction=(math.sin(a),0,math.cos(a)),
-            surface_normal_out=(0,0,-1))
+            surface_normal_out=(0,0,-1),
+            include_cutoff_in_se=include_cutoff_in_se)
         # The sweep NPZ does not record these values. Never claim a seed of 0,
         # a default configuration, or a database identity as actual provenance.
         del payload['case_seed']
@@ -69,12 +70,14 @@ def convert_case(path):
         # sweep since the q-unit fix).  A library without it predates the fix
         # and may have been generated with the wrong unit.
         metadata['q_unit'] = (str(z['q_unit'].item()) if 'q_unit' in z.files else None) or 'unknown'
-        payload['metadata_json'] = np.asarray(json.dumps(metadata,sort_keys=True))
+        if include_cutoff_in_se:
+            metadata['classification'] = 'SE: Eout <= cutoff; BSE: Eout > cutoff'
+        payload['metadata_json'] = np.asarray(json.dumps(metadata, sort_keys=True))
     case = ExportCase(**{k:(v.item() if v.ndim==0 else v) for k,v in payload.items()})
     case.validate()
     return material, case, payload, metadata
 
-def convert_library(input_dir, output_dir, probability_count=513):
+def convert_library(input_dir, output_dir, probability_count=513, *, include_cutoff_in_se=False):
     source, output = Path(input_dir), Path(output_dir)
     files = sorted(source.glob('*_emissions.npz'))
     if not files: raise ValueError(f'No *_emissions.npz files in {source}')
@@ -83,7 +86,7 @@ def convert_library(input_dir, output_dir, probability_count=513):
     probabilities = cosine_probability_grid(probability_count)
     # Validate all inputs before writing any output; prohibit mixed materials,
     # cutoffs and duplicate points instead of silently combining incompatible cases.
-    records = [convert_case(p) for p in files]
+    records = [convert_case(p, include_cutoff_in_se=include_cutoff_in_se) for p in files]
     materials = {r[0] for r in records}
     if len(materials)!=1: raise ValueError('Use a separate input directory per material')
     if len({r[1].energy_cutoff_ev for r in records})!=1: raise ValueError('Mixed cutoffs')
@@ -105,13 +108,16 @@ def convert_library(input_dir, output_dir, probability_count=513):
             rows.append(dict(angle_deg=angle,energy_ev=case.incident_energy_ev,
                 n_primaries=case.n_primaries,sey=case.sey,bsey=case.bsey,
                 tey=case.sey+case.bsey,raw_file=str(p.relative_to(output))))
-        export_angle_tables(directory,cases,material=material,probabilities=probabilities)
+        export_angle_tables(directory,cases,material=material,probabilities=probabilities,
+                            include_cutoff_in_se=include_cutoff_in_se)
         write_joint_angle_samplers(paths,directory,material=material)
     with (output/'sampler_manifest.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     (output/'sampler_generation.json').write_text(json.dumps(dict(
         schema='seemc-taichi-converted-sampler-library-v1',material=material,
-        classification='SE < cutoff; BSE >= cutoff',probability_count=probability_count,
+        classification=('SE <= cutoff; BSE > cutoff'
+                        if include_cutoff_in_se else 'SE < cutoff; BSE >= cutoff'),
+        probability_count=probability_count,
         source_cases=[r[3] for r in records],
         note='RFA CSV and joint NPZ formats match imaging exports. Raw checkpoints and manifest are conversion-specific; not imaging v6 resumable checkpoints.'),indent=2)+'\n')
     return rows
@@ -120,8 +126,11 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('input_dir'); p.add_argument('output_dir')
     p.add_argument('--probability-count',type=int,default=513)
+    p.add_argument('--include-cutoff-in-se', action='store_true',
+                   help='Assign events at the emitted-energy cutoff to SE for RFA use')
     a=p.parse_args()
-    rows=convert_library(a.input_dir,a.output_dir,a.probability_count)
+    rows=convert_library(a.input_dir,a.output_dir,a.probability_count,
+                         include_cutoff_in_se=a.include_cutoff_in_se)
     print(f'Exported {len(rows)} cases to {a.output_dir}')
 
 if __name__=='__main__': main()

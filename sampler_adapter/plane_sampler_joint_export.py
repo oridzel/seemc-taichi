@@ -52,7 +52,7 @@ def direction_angles(directions, vacuum_incident_direction, surface_normal_out):
 def case_payload_v2(*, emissions, incident_energy_ev, incidence_angle_deg,
                     n_primaries, case_seed, energy_cutoff_ev, config,
                     database_sha256, material, vacuum_incident_direction,
-                    surface_normal_out):
+                    surface_normal_out, include_cutoff_in_se=False):
     """Return a raw-case NPZ payload with legacy v1 + joint-direction fields."""
     E=np.asarray([float(e.energy) for e in emissions],dtype=float)
     dirs=np.asarray([e.uvw for e in emissions],dtype=float).reshape((-1,3)) if len(emissions) else np.empty((0,3))
@@ -64,8 +64,9 @@ def case_payload_v2(*, emissions, incident_energy_ev, incidence_angle_deg,
     else:
         u=np.empty((0,3)); theta=phi=mb=mt=ms=outward=np.empty(0)
 
-    # Match transport exactly: < cutoff is SE, >= cutoff is BSE.
-    se=E < float(energy_cutoff_ev); bse=~se
+    cutoff = float(energy_cutoff_ev)
+    se = E <= cutoff if include_cutoff_in_se else E < cutoff
+    bse = ~se
     def cnt(mask):
         valid=ids[mask]
         valid=valid[(valid>=0)&(valid<int(n_primaries))]
